@@ -29,7 +29,7 @@ _conn.commit()
 
 PATTERNS = [
     (re.compile(r"\bя работаю в ([A-ZА-Я][\w\- ]{1,40})", re.I), "works_at"),
-    (re.compile(r"\bя живу в ([A-ZА-Я][\w\- ]{1,40})", re.I), "lives_in"),
+    (re.compile(r"\bя живу в ([а-яА-Яa-zA-Z\-]+)", re.I), "lives_in"),
     (re.compile(r"\bя люблю (.{2,40})", re.I), "likes"),
     (re.compile(r"\b(?:я )?не люблю (.{2,40})", re.I), "dislikes"),
 ]
@@ -73,6 +73,7 @@ async def chat(request: Request):
     chat_id = request.headers.get("X-OpenWebUI-Chat-Id") or body.get("user") or "default"
     messages = body.get("messages", [])
 
+    # 1. Логируем реплику и извлекаем факты
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     if last_user and isinstance(last_user.get("content"), str):
         _conn.execute("INSERT INTO messages(chat_id,role,content,ts) VALUES (?,?,?,?)", (chat_id, "user", last_user["content"], time.time()))
@@ -80,6 +81,24 @@ async def chat(request: Request):
             _conn.execute("INSERT INTO facts(chat_id,predicate,object,evidence,ts) VALUES (?,?,?,?,?)", (chat_id, f["predicate"], f["object"], f["evidence"], time.time()))
         _conn.commit()
 
+    # 2. Достаем ВСЕ факты (без привязки к chat_id) и дедуплицируем
+    facts = _conn.execute("SELECT predicate, object FROM facts ORDER BY ts ASC").fetchall()
+    if facts:
+        unique_facts = {}
+        for pred, obj in facts:
+            unique_facts[pred] = obj  # Более новые перезаписывают старые
+        
+        fact_str = "\n".join([f"- {pred}: {obj}" for pred, obj in unique_facts.items()])
+        memory_block = f"\n\n[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ]\n{fact_str}\n[/ДОЛГОВРЕМЕННАЯ ПАМЯТЬ]"
+        
+        sys_msg = next((m for m in messages if m.get("role") == "system"), None)
+        if sys_msg:
+            sys_msg["content"] += memory_block
+        else:
+            messages.insert(0, {"role": "system", "content": memory_block})
+        body["messages"] = messages
+
+    # 3. Компрессия
     before = total_tokens(messages)
     if before > COMPRESS_AT:
         body["messages"] = compress(messages)
@@ -88,6 +107,7 @@ async def chat(request: Request):
         _conn.commit()
         print(f"[memory] compressed {before}->{after} tokens")
 
+    # 4. Стриминг ответа
     stream = bool(body.get("stream", False))
     async def relay_stream():
         acc = []
