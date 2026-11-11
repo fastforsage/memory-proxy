@@ -1,0 +1,14 @@
+services:
+  memory-proxy:
+    image: ghcr.io/fastforsage/memory-proxy:latest
+    build: . # Позволяет собрать локально, если не хотите ждать GitHub
+    container_name: memory-proxy
+    network_mode: host
+    environment:
+      - LLAMA_URL=http://127.0.0.1:8080/v1/chat/completions
+      - DB_PATH=/data/memory.db
+      - COMPRESS_AT=22000
+      - KEEP_RECENT=8
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
