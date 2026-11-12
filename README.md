@@ -30,49 +30,52 @@
 ```mermaid
 sequenceDiagram
     participant U as Open WebUI
-    participant P as Memory Proxy (FastAPI)
-    participant DB as SQLite (Temporal DB)
-    participant L as llama.cpp (Gemma 4)
+    participant P as Memory Proxy
+    participant DB as SQLite DB
+    participant L as llama.cpp
 
-    U->>P: POST /v1/chat/completions (User Text)
+    U->>P: POST /v1/chat/completions
     activate P
-    P->>DB: SELECT Active Facts + History + Mood
+    P->>DB: SELECT Facts, History, Mood
     DB-->>P: Context Data
-    
-    Note over P: Внедрение контекста перед последним сообщением (KV-Cache Friendly)
+
+    Note over P: Внедрение контекста (KV-Cache Friendly)
     P->>L: Forward Request (Stream)
     L-->>P: Stream Chunks
     P-->>U: Stream Chunks
     deactivate P
 
-    Note over P, L: Фоновый процесс (Single-Pass Cold Path)
-    P->>L: Prompt: "Extract JSON Facts + Emotions + Mood"
+    Note over P,L: Cold Path (Single-Pass)
+    P->>L: Extract Facts + Emotions + Mood
     L-->>P: JSON Response
-    Note over P: Proof-Check (цитата есть в тексте?)
-    P->>DB: UPSERT Facts (valid_from / valid_to)
-    P->>DB: UPDATE Emotions (с учетом Decay)
-    P->>DB: INSERT Mood (с TTL)
+    Note over P: Proof-Check (цитата есть?)
+    P->>DB: UPSERT Facts (valid_from/to)
+    P->>DB: UPDATE Emotions (Decay)
+    P->>DB: INSERT Mood (TTL)
+```
 
-Компоненты:
-Hot Path: Всё, что находится между получением запроса и отправкой его в llama.cpp. Работает <10 мс. Включает в себя сборку промпта из уже готовых данных в БД.
+### Компоненты:
+* **Hot Path:** Всё, что находится между получением запроса и отправкой его в llama.cpp. Работает <10 мс. Включает в себя сборку промпта из уже готовых данных в БД. 
+* **Cold Path (Фоновый):** Запускается *после* ответа пользователю. Отправляет текст на анализ модели, проверяет галлюцинации (verbatim match), обновляет SQLite и рассчитывает исторические метки.
+* **Математика эмоций:** `new_score = (old_score * exp(-0.023 * days_passed)) + valence`.
 
-Cold Path (Фоновый): Запускается после ответа пользователю. Отправляет текст на анализ модели, проверяет галлюцинации (verbatim match), обновляет SQLite и рассчитывает исторические метки.
+---
 
-Математика эмоций: new_score = (old_score * exp(-0.023 * days_passed)) + valence.
+## 🚀 Руководство по установке
 
-🚀 Руководство по установке
-Предварительные требования:
-Docker и Docker Compose.
+### Предварительные требования:
+* Docker и Docker Compose.
+* Запущенный сервер `llama.cpp` (в той же Docker-сети или доступный по IP).
 
-Запущенный сервер llama.cpp (в той же Docker-сети или доступный по IP).
-
-1. Создание общей сети
-bash
+### 1. Создание общей сети
+```bash
 docker network create llm-net
-2. Запуск через Docker Compose
-Создайте файл docker-compose.yml:
+```
 
-yaml
+### 2. Запуск через Docker Compose
+Создайте файл `docker-compose.yml`:
+
+```yaml
 version: '3.8'
 
 services:
@@ -96,80 +99,95 @@ services:
 networks:
   llm-net:
     external: true
+```
+
 Запустите:
-
-bash
+```bash
 docker compose up -d
-3. Настройка Open WebUI
-Зайдите в настройки Open WebUI -> Подключения.
+```
 
-Укажите URL: http://memory-proxy:8081/v1 (если Open WebUI в той же сети) или http://<IP_хоста>:8081/v1.
+### 3. Настройка Open WebUI
+1. Зайдите в настройки Open WebUI -> Подключения.
+2. Укажите URL: `http://memory-proxy:8081/v1` (если Open WebUI в той же сети) или `http://<IP_хоста>:8081/v1`.
+3. Ключ API: любой (например, `sk-no-key-required`).
 
-Ключ API: любой (например, sk-no-key-required).
+---
 
-📖 Руководство пользователя
+## 📖 Руководство пользователя
+
 После установки прокси работает незаметно. Вам не нужно менять привычки общения.
 
-Как работает память:
-Факты и история: Если вы скажете "Я живу в Питере и работаю в Сбере", прокси в фоне извлечет это. В следующем чате модель уже будет знать ваш город и место работы. Если вы скажете "Я переехал в Москву", старый факт про Питер останется в истории, и на вопрос "Где я жил раньше?" модель ответит с учетом хронологии.
+### Как работает память:
+1. **Факты и история:** Если вы скажете *"Я живу в Питере и работаю в Сбере"*, прокси в фоне извлечет это. В следующем чате модель уже будет знать ваш город и место работы. Если вы скажете *"Я переехал в Москву"*, старый факт про Питер останется в истории, и на вопрос *"Где я жил раньше?"* модель ответит с учетом хронологии.
+2. **Эмоции и затухание:** Если вы скажете *"Я обожаю Python, но Jira — это просто кошмар"*, прокси запишет `Python: +1.0`, `Jira: -1.0`. В будущем, когда речь зайдет о Jira, модель будет отвечать более сухо. Если через месяц вы скажете *"О, Jira починили"*, негативный вес начнет снижаться.
+3. **Настроение (Mood):** Если вы напишете *"Так, мне нужно срочно сосредоточиться"*, система на 30 минут включит режим `Focus`. В этом режиме модель будет отвечать кратко, а порог сжатия контекста увеличится, чтобы не потерять важные детали.
 
-Эмоции и затухание: Если вы скажете "Я обожаю Python, но Jira — это просто кошмар", прокси запишет Python: +1.0, Jira: -1.0. В будущем, когда речь зайдет о Jira, модель будет отвечать более сухо. Если через месяц вы скажете "О, Jira починили", негативный вес начнет снижаться.
+### Просмотр базы данных (для администратора):
 
-Настроение (Mood): Если вы напишете "Так, мне нужно срочно сосредоточиться", система на 30 минут включит режим Focus. В этом режиме модель будет отвечать кратко, а порог сжатия контекста увеличится, чтобы не потерять важные детали.
-
-Просмотр базы данных (для администратора):
-Активные факты:
-
-bash
+**Активные факты:**
+```bash
 docker exec -it memory-proxy python -c "
 import sqlite3
 c = sqlite3.connect('/data/memory.db')
 for row in c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NULL'):
     print(f'{row[0]}: {row[1]}')
 "
-История (прошлые факты):
+```
 
-bash
+**История (прошлые факты):**
+```bash
 docker exec -it memory-proxy python -c "
 import sqlite3
 c = sqlite3.connect('/data/memory.db')
 for row in c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NOT NULL LIMIT 10'):
     print(f'{row[0]}: {row[1]}')
 "
-Эмоциональный профиль:
+```
 
-bash
+**Эмоциональный профиль:**
+```bash
 docker exec -it memory-proxy python -c "
 import sqlite3
 c = sqlite3.connect('/data/memory.db')
 for row in c.execute('SELECT trigger, score, mention_count FROM emotions ORDER BY score ASC LIMIT 10'):
     print(f'{row[0]}: {row[1]:.2f} (упомянуто {row[2]} раз)')
 "
-Текущее настроение:
+```
 
-bash
+**Текущее настроение:**
+```bash
 docker exec -it memory-proxy python -c "
 import sqlite3
 c = sqlite3.connect('/data/memory.db')
 print(c.execute('SELECT state, intensity FROM mood_state ORDER BY ts DESC LIMIT 1').fetchone())
 "
-⚙️ Описание настроек (Environment Variables)
-Переменная	По умолчанию	Описание
-LLAMA_URL	http://127.0.0.1:8080/v1/chat/completions	Полный URL до API вашего llama.cpp / Ollama.
-DB_PATH	/data/memory.db	Путь к файлу SQLite внутри контейнера. Обязательно маунтить volume.
-COMPRESS_AT	22000	Базовый лимит токенов для срабатывания умного сжатия.
-KEEP_RECENT	8	Сколько последних сообщений оставить нетронутыми при сжатии.
-MOOD_TTL	1800	Время жизни текущего настроения (в секундах). По умолчанию 30 минут.
-🛠 Технологический стек
-Python 3.11 + FastAPI (асинхронный сервер).
+```
 
-SQLite (WAL mode) — надежное и быстрое локальное хранилище с поддержкой временных меток.
+---
 
-httpx — асинхронные запросы к llama.cpp.
+## ⚙️ Описание настроек (Environment Variables)
 
-Docker — изоляция и легкое развертывание.
+| Переменная | По умолчанию | Описание |
+| :--- | :--- | :--- |
+| `LLAMA_URL` | `http://127.0.0.1:8080/v1/chat/completions` | Полный URL до API вашего llama.cpp / Ollama. |
+| `DB_PATH` | `/data/memory.db` | Путь к файлу SQLite внутри контейнера. Обязательно маунтить volume. |
+| `COMPRESS_AT` | `22000` | Базовый лимит токенов для срабатывания умного сжатия. |
+| `KEEP_RECENT` | `8` | Сколько последних сообщений оставить нетронутыми при сжатии. |
+| `MOOD_TTL` | `1800` | Время жизни текущего настроения (в секундах). По умолчанию 30 минут. |
 
-📄 Лицензия
+---
+
+## 🛠 Технологический стек
+* **Python 3.11** + **FastAPI** (асинхронный сервер).
+* **SQLite** (WAL mode) — надежное и быстрое локальное хранилище с поддержкой временных меток.
+* **httpx** — асинхронные запросы к llama.cpp.
+* **Docker** — изоляция и легкое развертывание.
+
+---
+
+## 📄 Лицензия
 MIT License. Используйте, модифицируйте и распространяйте свободно.
 
-Сделано с любовью к локальным LLM и чистому коду.
+---
+*Сделано с любовью к локальным LLM и чистому коду.*
+```
