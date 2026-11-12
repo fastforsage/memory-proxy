@@ -52,6 +52,7 @@ sequenceDiagram
     P->>DB: UPSERT Facts (valid_from / valid_to)
     P->>DB: UPDATE Emotions (с учетом Decay)
     P->>DB: INSERT Mood (с TTL)
+
 Компоненты:
 Hot Path: Всё, что находится между получением запроса и отправкой его в llama.cpp. Работает <10 мс. Включает в себя сборку промпта из уже готовых данных в БД.
 
