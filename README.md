@@ -122,45 +122,69 @@ docker compose up -d
 2. **Эмоции и затухание:** Если вы скажете *"Я обожаю Python, но Jira — это просто кошмар"*, прокси запишет `Python: +1.0`, `Jira: -1.0`. В будущем, когда речь зайдет о Jira, модель будет отвечать более сухо. Если через месяц вы скажете *"О, Jira починили"*, негативный вес начнет снижаться.
 3. **Настроение (Mood):** Если вы напишете *"Так, мне нужно срочно сосредоточиться"*, система на 30 минут включит режим `Focus`. В этом режиме модель будет отвечать кратко, а порог сжатия контекста увеличится, чтобы не потерять важные детали.
 
-### Просмотр базы данных (для администратора):
+---
+
+## 🩺 Системные команды и диагностика
+
+Этот раздел предназначен для администраторов и отладки.
+
+### 1. Проверка состояния API
+Убедитесь, что прокси запущен и видит модель:
+```bash
+# Проверка Healthcheck
+curl -s http://localhost:8081/health
+
+# Проверка связи с llama.cpp (прокси запрашивает список моделей у вашей LLM)
+curl -s http://localhost:8081/v1/models | head -c 200
+```
+*(Если второй запрос возвращает ошибку 500, значит прокси не может достучаться до `LLAMA_URL`, указанного в `docker-compose.yml`).*
+
+### 2. Просмотр логов
+Смотреть ошибки парсинга JSON или работу фоновых задач:
+```bash
+# Последние 50 строк с обновлением в реальном времени
+docker logs --tail 50 -f memory-proxy
+```
+*(Если вы видите `Cold path error: Expecting value`, значит модель вернула невалидный JSON. Убедитесь, что llama.cpp запущен с флагом `--jinja` и модель поддерживает `json_object`).*
+
+### 3. Проверка связи изнутри контейнера
+Если Open WebUI пишет `TimeoutError`, проверьте, видит ли прокси вашу LLM:
+```bash
+docker exec -it memory-proxy curl -s http://gemma4-hauhaucs:8080/v1/models
+```
+
+### 4. Инспекция Базы Данных
+Посмотреть содержимое SQLite напрямую (без запуска Python-скриптов):
 
 **Активные факты:**
 ```bash
-docker exec -it memory-proxy python -c "
-import sqlite3
-c = sqlite3.connect('/data/memory.db')
-for row in c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NULL'):
-    print(f'{row[0]}: {row[1]}')
-"
+docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT predicate, object FROM facts WHERE valid_to IS NULL;"
 ```
 
 **История (прошлые факты):**
 ```bash
-docker exec -it memory-proxy python -c "
-import sqlite3
-c = sqlite3.connect('/data/memory.db')
-for row in c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NOT NULL LIMIT 10'):
-    print(f'{row[0]}: {row[1]}')
-"
+docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT predicate, object FROM facts WHERE valid_to IS NOT NULL LIMIT 10;"
 ```
 
 **Эмоциональный профиль:**
 ```bash
-docker exec -it memory-proxy python -c "
-import sqlite3
-c = sqlite3.connect('/data/memory.db')
-for row in c.execute('SELECT trigger, score, mention_count FROM emotions ORDER BY score ASC LIMIT 10'):
-    print(f'{row[0]}: {row[1]:.2f} (упомянуто {row[2]} раз)')
-"
+docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT trigger, score, mention_count FROM emotions ORDER BY score ASC LIMIT 10;"
 ```
 
 **Текущее настроение:**
 ```bash
-docker exec -it memory-proxy python -c "
-import sqlite3
-c = sqlite3.connect('/data/memory.db')
-print(c.execute('SELECT state, intensity FROM mood_state ORDER BY ts DESC LIMIT 1').fetchone())
-"
+docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT state, intensity FROM mood_state ORDER BY ts DESC LIMIT 1;"
+```
+
+### 5. Аварийный сброс памяти
+Если база засорилась мусором или вы хотите начать с чистого листа:
+```bash
+# Остановить контейнер
+docker stop memory-proxy
+# Удалить файл базы
+rm -rf /home/admin/memory-mvp/data/memory.db
+# Запустить контейнер (создастся чистая база)
+docker start memory-proxy
 ```
 
 ---
