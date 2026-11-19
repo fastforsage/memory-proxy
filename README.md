@@ -38,41 +38,52 @@
 
 ## 🏗 Архитектура
 
-```
-Open WebUI / Client
-        │  POST /v1/chat/completions
-        ▼
-┌───────────────────────────────────────────┐
-│  memory-proxy (FastAPI + uvloop)          │
-│                                           │
-│  HOT PATH (<10 мс)                        │
-│  ├─ Slash commands (/chats, /pull)        │
-│  ├─ Semantic classifier (zlib)            │
-│  ├─ Hybrid search:                        │
-│  │    FTS5 (BM25) ─┐                      │
-│  │    sqlite-vec ──┼─ RRF ─► top-15 facts │
-│  │    USER2 (ONNX) ┘                      │
-│  ├─ Context Bridge (cross-chat)           │
-│  └─ Prompt assembly                       │
-│                                           │
-│  COLD PATH (async)                        │
-│  ├─ LLM extractor (facts + emotions)      │
-│  ├─ Proof-check (verbatim)                │
-│  ├─ Embedding (batch)                     │
-│  ├─ Time Decay (emotions)                 │
-│  └─ Summarization (on overflow)           │
-└───────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────┐     ┌─────────────────────────┐
-│  SQLite (WAL mode)        │     │  llama.cpp / Ollama     │
-│  ├─ messages + messages_fts│     │  (любая OpenAI-LLM)     │
-│  ├─ facts + facts_fts     │     └─────────────────────────┘
-│  ├─ vec_facts (sqlite-vec)│
-│  ├─ emotions              │
-│  ├─ mood_state            │
-│  └─ summaries             │
-└───────────────────────────┘
+```mermaid
+flowchart TD
+    Client(["Open WebUI / Client"]) -->|"POST /v1/chat/completions"| Proxy["memory-proxy<br/>(FastAPI + uvloop)"]
+
+    subgraph HOT ["HOT PATH — < 10 мс"]
+        direction TB
+        A1["Slash commands<br/>/chats · /pull"]
+        A2["Semantic classifier (zlib)"]
+        A3["Hybrid search"]
+        A4["Context Bridge (cross-chat)"]
+        A5["Prompt assembly"]
+        A1 --> A2 --> A3 --> A4 --> A5
+    end
+
+    subgraph SEARCH ["Hybrid search → top-15 facts"]
+        direction LR
+        FTS["FTS5 (BM25)"] --> RRF["RRF"]
+        VEC["sqlite-vec"] --> RRF
+        EMB["USER2 (ONNX)"] --> RRF
+    end
+    A3 -.-> SEARCH
+
+    subgraph COLD ["COLD PATH — async"]
+        direction TB
+        C1["LLM extractor<br/>(facts + emotions)"]
+        C2["Proof-check (verbatim)"]
+        C3["Embedding (batch)"]
+        C4["Time Decay (emotions)"]
+        C5["Summarization (on overflow)"]
+        C1 --> C2 --> C3 --> C4 --> C5
+    end
+
+    Proxy --- HOT
+    Proxy --- COLD
+    COLD -.->|"async LLM calls"| LLM["llama.cpp / Ollama<br/>(любая OpenAI-LLM)"]
+
+    Proxy -->|"reads / writes"| DB[("SQLite — WAL mode")]
+    subgraph SCHEMA ["Схемы"]
+        direction LR
+        S1["messages + messages_fts"]
+        S2["facts + facts_fts"]
+        S3["vec_facts (sqlite-vec)"]
+        S4["emotions / mood_state"]
+        S5["summaries"]
+    end
+    DB --- SCHEMA
 ```
 
 ---
