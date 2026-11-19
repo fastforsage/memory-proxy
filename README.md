@@ -41,8 +41,7 @@
 ```mermaid
 flowchart TD
     Client(["Open WebUI / Client"]) -->|"POST /v1/chat/completions"| Proxy["memory-proxy<br/>(FastAPI + uvloop)"]
-
-    subgraph HOT ["HOT PATH — < 10 мс"]
+    subgraph HOT ["🔥 HOT PATH — < 10 мс"]
         direction TB
         A1["Slash commands<br/>/chats · /pull"]
         A2["Semantic classifier (zlib)"]
@@ -51,7 +50,6 @@ flowchart TD
         A5["Prompt assembly"]
         A1 --> A2 --> A3 --> A4 --> A5
     end
-
     subgraph SEARCH ["Hybrid search → top-15 facts"]
         direction LR
         FTS["FTS5 (BM25)"] --> RRF["RRF"]
@@ -59,8 +57,7 @@ flowchart TD
         EMB["USER2 (ONNX)"] --> RRF
     end
     A3 -.-> SEARCH
-
-    subgraph COLD ["COLD PATH — async"]
+    subgraph COLD ["🧊 COLD PATH — async"]
         direction TB
         C1["LLM extractor<br/>(facts + emotions)"]
         C2["Proof-check (verbatim)"]
@@ -69,11 +66,9 @@ flowchart TD
         C5["Summarization (on overflow)"]
         C1 --> C2 --> C3 --> C4 --> C5
     end
-
     Proxy --- HOT
     Proxy --- COLD
     COLD -.->|"async LLM calls"| LLM["llama.cpp / Ollama<br/>(любая OpenAI-LLM)"]
-
     Proxy -->|"reads / writes"| DB[("SQLite — WAL mode")]
     subgraph SCHEMA ["Схемы"]
         direction LR
