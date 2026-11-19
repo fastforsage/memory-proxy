@@ -1,217 +1,337 @@
-# 🧠 Memory Proxy for Local LLMs (v4 Temporal)
+# 🧠 memory-proxy
 
-**Умный слой памяти и эмоционального интеллекта для локальных LLM (llama.cpp / Ollama), совместимый с Open WebUI.**
+**Local-first memory layer for LLMs with semantic search, temporal facts, and cross-chat context bridge.**
 
-Прокси-сервер перехватывает запросы в формате OpenAI API, незаметно для пользователя извлекает факты, эмоции и текущее настроение в фоновом режиме, и внедряет их в системный промпт. Это дает локальной модели «бесконечную» память, адаптивный тон общения и защиту от галлюцинаций, не замедляя генерацию ответа.
+[![Docker Image](https://img.shields.io/badge/docker-fastforsage%2Fmemory--proxy%3Av4.6-blue?logo=docker)](https://hub.docker.com/r/fastforsage/memory-proxy)
+[![Version](https://img.shields.io/badge/version-4.6-green)](https://github.com/fastforsage/memory-proxy/releases)
+[![Size](https://img.shields.io/badge/image-~450MB-lightgrey)](#)
+[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
-## 🎯 Функциональные требования (ТЗ v4)
-
-### Основные функции:
-1. **Прозрачный прокси:** Полная совместимость с OpenAI API (эндпоинты `/v1/chat/completions`, `/v1/models`).
-2. **Temporal Facts (История):** Система не удаляет старые факты. При смене работы или города старый факт помечается как исторический (`valid_to`), а новый становится активным. Модель может ответить на вопрос «А где я жил раньше?», опираясь на хронологию.
-3. **Безопасная инвалидация:** Предикаты разделены на `SINGLE_VALUED` (город, работа — перезаписываются) и `MULTI_VALUED` (навыки, хобби — накапливаются). Это защищает от потери данных, когда вы говорите «Я знаю Python и Rust».
-4. **Эмоциональный интеллект:** Извлечение эмоционального фона к триггерам (темам/инструментам) с накоплением веса.
-5. **Time Decay (Затухание):** Эмоции имеют свойство «остывать» со временем. Система применяет экспоненциальное затухание (полураспад ~30 дней). Если вы перестали ненавидеть Jira, её негативный вес снизится.
-6. **Mood Engine:** Определяет текущее состояние пользователя (`Focus`, `Relaxed`, `Irritated` и др.) с TTL (30 минут) и мягко корректирует стиль ответа.
-7. **Динамическое сжатие (Adaptive Context):** Порог сжатия контекста зависит от текущего настроения. Если вы в состоянии `Focus`, порог увеличивается (до 33k токенов), чтобы модель не теряла важные детали.
-8. **Proof-Check (Анти-галлюцинации):** Факты и эмоции принимаются только если LLM приложила дословную цитату из текста пользователя.
-
-### Нефункциональные требования:
-* **Zero-Latency (Hot Path):** Ответ пользователю начинает стримиться мгновенно. Извлечение памяти работает в фоне через `asyncio.create_task`.
-* **KV-Cache Optimization:** Динамический блок памяти вставляется как отдельное `system`-сообщение перед последней репликой пользователя. Это сохраняет статичный префикс промпта и позволяет llama.cpp переиспользовать KV-кэш.
-* **Single-Pass Cold Path:** Один запрос к LLM извлекает сразу Факты, Эмоции и Настроение (Mood), возвращая комплексный JSON. Это снижает нагрузку на GPU в 2–3 раза.
-* **Локальность:** Никаких внешних API (OpenAI, Anthropic). База данных — локальный SQLite.
-* **Управление очередью GPU:** Использование `asyncio.Semaphore(1)` для предотвращения конфликтов, если llama.cpp запущен с `--parallel 1`.
+`memory-proxy` — это лёгкий FastAPI-прокси между любым OpenAI-совместимым клиентом (Open WebUI, SillyTavern, LibreChat) и локальной LLM (llama.cpp, Ollama, vLLM). Он даёт модели **долговременную память**, **семантический поиск**, **эмоциональные якоря** и **сквозной контекст между чатами** — без облаков, без задержек, без утечек.
 
 ---
 
-## 🏗 Архитектура решения
+## ✨ Что внутри (v4.6)
 
-```mermaid
-sequenceDiagram
-    participant U as Open WebUI
-    participant P as Memory Proxy
-    participant DB as SQLite DB
-    participant L as llama.cpp
+| Слой | Что делает |
+| :--- | :--- |
+| **Temporal Facts** | История изменений (`works_at`, `lives_in`) с `valid_from` / `valid_to`. Модель знает, что «раньше» ≠ «сейчас». |
+| **Semantic Search** | Гибридный поиск: **FTS5 (BM25) + sqlite-vec (KNN) + RRF**. Русскоязычная модель **USER2-small** через **ONNX Runtime** (FP32, bit-identical качество). |
+| **Context Bridge** | Сквозной поиск по всем чатам. Auto-триггеры («помнишь», «обсуждали») + слэш-команды `/chats`, `/pull`, `/search`. |
+| **Emotional Anchors** | Эмоции к темам (`Jira: -1.0`) с экспоненциальным затуханием (Time Decay). |
+| **Mood Engine** | Текущее настроение пользователя (Focus / Irritated / Relaxed) с TTL 30 мин. |
+| **Semantic Classifier** | Классификация «код vs личный текст» через **zlib** compression ratio. Технические сообщения не засоряют память. |
+| **Proof-Check** | Факт/эмоция принимаются только с дословной цитатой (`evidence`, `quote`). Анти-галлюцинации. |
+| **Smart Compression** | LLM-суммаризация контекста при переполнении окна. |
 
-    U->>P: POST /v1/chat/completions
-    activate P
-    P->>DB: SELECT Facts, History, Mood
-    DB-->>P: Context Data
+### ⚡ Производительность
 
-    Note over P: Внедрение контекста (KV-Cache Friendly)
-    P->>L: Forward Request (Stream)
-    L-->>P: Stream Chunks
-    P-->>U: Stream Chunks
-    deactivate P
+| Метрика | Значение |
+| :--- | :--- |
+| Hot Path overhead | **< 10 мс** |
+| Эмбеддинг (CPU) | **~5 мс** (ONNX, ×3 быстрее PyTorch) |
+| RAM на инференс | **~50 MB** |
+| Размер образа | **~450 MB** (без PyTorch/CUDA) |
+| Первый старт | ~10–20 сек (загрузка ONNX) |
 
-    Note over P,L: Cold Path (Single-Pass)
-    P->>L: Extract Facts + Emotions + Mood
-    L-->>P: JSON Response
-    Note over P: Proof-Check (цитата есть?)
-    P->>DB: UPSERT Facts (valid_from/to)
-    P->>DB: UPDATE Emotions (Decay)
-    P->>DB: INSERT Mood (TTL)
+---
+
+## 🏗 Архитектура
+
+```
+Open WebUI / Client
+        │  POST /v1/chat/completions
+        ▼
+┌───────────────────────────────────────────┐
+│  memory-proxy (FastAPI + uvloop)          │
+│                                           │
+│  HOT PATH (<10 мс)                        │
+│  ├─ Slash commands (/chats, /pull)        │
+│  ├─ Semantic classifier (zlib)            │
+│  ├─ Hybrid search:                        │
+│  │    FTS5 (BM25) ─┐                      │
+│  │    sqlite-vec ──┼─ RRF ─► top-15 facts │
+│  │    USER2 (ONNX) ┘                      │
+│  ├─ Context Bridge (cross-chat)           │
+│  └─ Prompt assembly                       │
+│                                           │
+│  COLD PATH (async)                        │
+│  ├─ LLM extractor (facts + emotions)      │
+│  ├─ Proof-check (verbatim)                │
+│  ├─ Embedding (batch)                     │
+│  ├─ Time Decay (emotions)                 │
+│  └─ Summarization (on overflow)           │
+└───────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────┐     ┌─────────────────────────┐
+│  SQLite (WAL mode)        │     │  llama.cpp / Ollama     │
+│  ├─ messages + messages_fts│     │  (любая OpenAI-LLM)     │
+│  ├─ facts + facts_fts     │     └─────────────────────────┘
+│  ├─ vec_facts (sqlite-vec)│
+│  ├─ emotions              │
+│  ├─ mood_state            │
+│  └─ summaries             │
+└───────────────────────────┘
 ```
 
-### Компоненты:
-* **Hot Path:** Всё, что находится между получением запроса и отправкой его в llama.cpp. Работает <10 мс. Включает в себя сборку промпта из уже готовых данных в БД. 
-* **Cold Path (Фоновый):** Запускается *после* ответа пользователю. Отправляет текст на анализ модели, проверяет галлюцинации (verbatim match), обновляет SQLite и рассчитывает исторические метки.
-* **Математика эмоций:** `new_score = (old_score * exp(-0.023 * days_passed)) + valence`.
-
 ---
 
-## 🚀 Руководство по установке
+## 🚀 Быстрый старт
 
-### Предварительные требования:
-* Docker и Docker Compose.
-* Запущенный сервер `llama.cpp` (в той же Docker-сети или доступный по IP).
+### 1. Docker
 
-### 1. Создание общей сети
 ```bash
-docker network create llm-net
+docker pull fastforsage/memory-proxy:v4.6
 ```
 
-### 2. Запуск через Docker Compose
-Создайте файл `docker-compose.yml`:
+### 2. `docker-compose.yml`
 
 ```yaml
-version: '3.8'
-
 services:
   memory-proxy:
-    image: fastforsage/memory-proxy:v4
+    image: fastforsage/memory-proxy:v4.6
     container_name: memory-proxy
     environment:
-      - LLAMA_URL=http://gemma4-hauhaucs:8080/v1/chat/completions
+      - LLAMA_URL=http://host.docker.internal:8080/v1/chat/completions
       - DB_PATH=/data/memory.db
       - COMPRESS_AT=22000
       - KEEP_RECENT=8
-      - MOOD_TTL=1800
     volumes:
       - ./data:/data
     ports:
       - "8081:8081"
-    networks:
-      - llm-net
     restart: unless-stopped
-
-networks:
-  llm-net:
-    external: true
 ```
 
-Запустите:
+### 3. Запуск
+
 ```bash
 docker compose up -d
+curl http://localhost:8081/health
+# {"status": true}
 ```
 
-### 3. Настройка Open WebUI
-1. Зайдите в настройки Open WebUI -> Подключения.
-2. Укажите URL: `http://memory-proxy:8081/v1` (если Open WebUI в той же сети) или `http://<IP_хоста>:8081/v1`.
-3. Ключ API: любой (например, `sk-no-key-required`).
+### 4. Подключение клиента
 
----
-
-## 📖 Руководство пользователя
-
-После установки прокси работает незаметно. Вам не нужно менять привычки общения.
-
-### Как работает память:
-1. **Факты и история:** Если вы скажете *"Я живу в Питере и работаю в Сбере"*, прокси в фоне извлечет это. В следующем чате модель уже будет знать ваш город и место работы. Если вы скажете *"Я переехал в Москву"*, старый факт про Питер останется в истории, и на вопрос *"Где я жил раньше?"* модель ответит с учетом хронологии.
-2. **Эмоции и затухание:** Если вы скажете *"Я обожаю Python, но Jira — это просто кошмар"*, прокси запишет `Python: +1.0`, `Jira: -1.0`. В будущем, когда речь зайдет о Jira, модель будет отвечать более сухо. Если через месяц вы скажете *"О, Jira починили"*, негативный вес начнет снижаться.
-3. **Настроение (Mood):** Если вы напишете *"Так, мне нужно срочно сосредоточиться"*, система на 30 минут включит режим `Focus`. В этом режиме модель будет отвечать кратко, а порог сжатия контекста увеличится, чтобы не потерять важные детали.
-
----
-
-## 🩺 Системные команды и диагностика
-
-Этот раздел предназначен для администраторов и отладки.
-
-### 1. Проверка состояния API
-Убедитесь, что прокси запущен и видит модель:
-```bash
-# Проверка Healthcheck
-curl -s http://localhost:8081/health
-
-# Проверка связи с llama.cpp (прокси запрашивает список моделей у вашей LLM)
-curl -s http://localhost:8081/v1/models | head -c 200
-```
-*(Если второй запрос возвращает ошибку 500, значит прокси не может достучаться до `LLAMA_URL`, указанного в `docker-compose.yml`).*
-
-### 2. Просмотр логов
-Смотреть ошибки парсинга JSON или работу фоновых задач:
-```bash
-# Последние 50 строк с обновлением в реальном времени
-docker logs --tail 50 -f memory-proxy
-```
-*(Если вы видите `Cold path error: Expecting value`, значит модель вернула невалидный JSON. Убедитесь, что llama.cpp запущен с флагом `--jinja` и модель поддерживает `json_object`).*
-
-### 3. Проверка связи изнутри контейнера
-Если Open WebUI пишет `TimeoutError`, проверьте, видит ли прокси вашу LLM:
-```bash
-docker exec -it memory-proxy curl -s http://gemma4-hauhaucs:8080/v1/models
-```
-
-### 4. Инспекция Базы Данных
-Посмотреть содержимое SQLite напрямую (без запуска Python-скриптов):
-
-**Активные факты:**
-```bash
-docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT predicate, object FROM facts WHERE valid_to IS NULL;"
-```
-
-**История (прошлые факты):**
-```bash
-docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT predicate, object FROM facts WHERE valid_to IS NOT NULL LIMIT 10;"
-```
-
-**Эмоциональный профиль:**
-```bash
-docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT trigger, score, mention_count FROM emotions ORDER BY score ASC LIMIT 10;"
-```
-
-**Текущее настроение:**
-```bash
-docker exec -it memory-proxy sqlite3 /data/memory.db "SELECT state, intensity FROM mood_state ORDER BY ts DESC LIMIT 1;"
-```
-
-### 5. Аварийный сброс памяти
-Если база засорилась мусором или вы хотите начать с чистого листа:
-```bash
-# Остановить контейнер
-docker stop memory-proxy
-# Удалить файл базы
-rm -rf /home/admin/memory-mvp/data/memory.db
-# Запустить контейнер (создастся чистая база)
-docker start memory-proxy
-```
-
----
-
-## ⚙️ Описание настроек (Environment Variables)
-
-| Переменная | По умолчанию | Описание |
+| Клиент | URL | API Key |
 | :--- | :--- | :--- |
-| `LLAMA_URL` | `http://127.0.0.1:8080/v1/chat/completions` | Полный URL до API вашего llama.cpp / Ollama. |
-| `DB_PATH` | `/data/memory.db` | Путь к файлу SQLite внутри контейнера. Обязательно маунтить volume. |
-| `COMPRESS_AT` | `22000` | Базовый лимит токенов для срабатывания умного сжатия. |
-| `KEEP_RECENT` | `8` | Сколько последних сообщений оставить нетронутыми при сжатии. |
-| `MOOD_TTL` | `1800` | Время жизни текущего настроения (в секундах). По умолчанию 30 минут. |
+| **Open WebUI** | `http://host.docker.internal:8081/v1` | `sk-no-key` |
+| **SillyTavern** | `http://localhost:8081/v1` | `sk-no-key` |
+| **curl** | `http://localhost:8081/v1/chat/completions` | — |
 
 ---
 
-## 🛠 Технологический стек
-* **Python 3.11** + **FastAPI** (асинхронный сервер).
-* **SQLite** (WAL mode) — надежное и быстрое локальное хранилище с поддержкой временных меток.
-* **httpx** — асинхронные запросы к llama.cpp.
-* **Docker** — изоляция и легкое развертывание.
+## 🎮 Слэш-команды (Context Bridge)
 
----
+Пиши прямо в чате клиента:
 
-## 📄 Лицензия
-MIT License. Используйте, модифицируйте и распространяйте свободно.
+| Команда | Что делает |
+| :--- | :--- |
+| `/chats` | Список всех чатов с превью и датой |
+| `/pull <N>` | Загрузить последние 15 сообщений из чата №N |
+| `/pull <id>` | Загрузить по первым 8 символам `chat_id` |
+| `/search <query>` | FTS5-поиск по всем чатам |
+| `/help` | Справка |
 
----
-*Сделано с любовью к локальным LLM и чистому коду.*
+**Пример:**
 ```
+Ты: /pull 2
+Proxy: [ЗАГРУЖЕН КОНТЕКСТ ИЗ ЧАТА a1b2c3d4]
+       User: Мы обсуждали FastAPI + JWT...
+       You: Да, stateless токены с expiry...
+
+Ты: Напомни, какой JWT-секрет мы использовали?
+```
+
+**Auto-триггеры** (не нужно вводить команду):
+- «помнишь», «обсуждали», «говорили»
+- «в другом чате», «ранее», «в прошлый раз»
+- «мы с тобой», «как мы»
+
+Если фраза совпала — прокси сам ищет контекст в других чатах.
+
+---
+
+## ⚙️ Конфигурация
+
+| ENV переменная | Default | Описание |
+| :--- | :--- | :--- |
+| `LLAMA_URL` | `http://127.0.0.1:8080/v1/chat/completions` | OpenAI-совместимый endpoint LLM |
+| `DB_PATH` | `/data/memory.db` | Путь к SQLite (внутри контейнера) |
+| `COMPRESS_AT` | `22000` | Порог токенов для суммаризации |
+| `KEEP_RECENT` | `8` | Сколько последних сообщений оставить при сжатии |
+| `MAX_INPUT_LEN` | `200000` | Жёсткий отсев абсурдно длинных сообщений |
+
+---
+
+## 🗄 Схема БД
+
+```sql
+messages      -- все сообщения (chat_id, role, content, content_type)
+messages_fts  -- FTS5-индекс по messages (для cross-chat поиска)
+facts         -- факты с temporal validity (valid_from, valid_to)
+facts_fts     -- FTS5-индекс по facts
+vec_facts     -- sqlite-vec эмбеддинги (384-dim, USER2-small)
+emotions      -- эмоциональные якоря (trigger, score, decay)
+mood_state    -- текущее настроение (TTL 30 мин)
+summaries     -- LLM-суммаризации (при overflow)
+```
+
+Миграции применяются **автоматически** при старте (`ALTER TABLE IF NOT EXISTS`).
+
+---
+
+## 🧪 Примеры использования
+
+### Память с историей
+```
+Ты: Я живу в Москве
+    → запомнит: lives_in: Москве (valid_from=now)
+
+Ты: Я переехал в Питер
+    → инвалидирует: Москве (valid_to=now), добавит: Питере
+
+Ты: Где я жил раньше?
+    → модель ответит: «В Москве» (через [ИСТОРИЯ])
+```
+
+### Семантический поиск
+```
+Ты: Я люблю программировать на Python и Rust
+    → embedding (USER2-small)
+
+Ты: Что я люблю делать?
+    → гибридный поиск (FTS5 + vector) → Python, Rust
+    (даже если в запросе нет слова "Python")
+```
+
+### Эмоции
+```
+Ты: Ненавижу Jira, она бесит
+    → emotion: Jira = -1.0
+
+Ты: Что ты знаешь о Jira?
+    → модель видит: "Негатив: Jira" и отвечает сухо
+```
+
+### Mood
+```
+Ты: Я так устал, всё бесит
+    → mood_state: Irritated (0.8)
+
+Ты: Посоветуй, чем заняться вечером
+    → ответ мягче, без энтузиазма
+```
+
+---
+
+## 🔍 Диагностика
+
+### Проверить факты в БД
+
+```bash
+docker exec -it memory-proxy python -c "
+import sqlite3
+c = sqlite3.connect('/data/memory.db')
+print('Активные:', c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NULL').fetchall())
+print('История:', c.execute('SELECT predicate, object FROM facts WHERE valid_to IS NOT NULL').fetchall())
+"
+```
+
+### Проверить векторы
+
+```bash
+docker exec -it memory-proxy python -c "
+import sqlite3, sqlite_vec
+c = sqlite3.connect('/data/memory.db')
+c.enable_load_extension(True); sqlite_vec.load(c)
+print('Векторов:', c.execute('SELECT COUNT(*) FROM vec_facts').fetchone()[0])
+"
+```
+
+### Логи в реальном времени
+
+```bash
+docker logs -f memory-proxy | grep -E '(Cold|Semantic|Hybrid|ContextBridge|Skip)'
+```
+
+**Что означают теги:**
+- `[Cold OK]` — успешно извлечены факты/эмоции
+- `[Cold Skip]` — пропущено (technical)
+- `[Semantic] Batch-embedded N facts` — батчевый эмбеддинг
+- `[Hybrid] FTS/Vec` — какой канал поиска сработал
+- `[ContextBridge] Auto:` — cross-chat auto-search
+
+---
+
+## 🛠 Сборка из исходников
+
+```bash
+git clone https://github.com/fastforsage/memory-proxy.git
+cd memory-proxy
+
+# Сборка (ONNX, без PyTorch)
+docker build -t fastforsage/memory-proxy:v4.6 .
+
+# Пуш
+docker push fastforsage/memory-proxy:v4.6
+```
+
+**Структура проекта:**
+```
+memory-proxy/
+├── Dockerfile
+├── requirements.txt
+├── proxy.py              # FastAPI app
+├── download_model.py     # HF snapshot download
+├── .dockerignore
+└── data/                 # SQLite (volume, не коммитится)
+```
+
+---
+
+## 🆚 Сравнение с аналогами
+
+| Проект | Стек | Семантика | Context Bridge | Локальность | Размер |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **memory-proxy** | SQLite + sqlite-vec | ✅ Hybrid (FTS + vec) | ✅ | ✅ Full | **~450 MB** |
+| Mem0 | Qdrant + KV | ✅ Vector | ⚠️ Partial | ❌ Cloud-first | > 2 GB |
+| Letta (MemGPT) | Postgres + pgvector | ✅ Vector | ⚠️ Per-session | ❌ Server | > 1 GB |
+| Zep / Graphiti | Neo4j | ✅ Graph+Vec | ⚠️ Episodes | ❌ Cloud | > 3 GB |
+
+**Чем `memory-proxy` отличается:**
+- 🎯 **Single-file SQLite** — вся память в одном `.db`, легко бэкапить
+- 🇷🇺 **USER2-small** — специально обученная русскоязычная модель
+- 🧬 **Temporal facts** — история изменений (не только «текущее»)
+- 🌉 **Context Bridge** — сквозной поиск по чатам из коробки
+- ⚡ **~450 MB** — работает на любом CPU без GPU
+
+---
+
+## 📋 Roadmap
+
+- [x] v4.0 — Temporal facts, эмоции, mood
+- [x] v4.4 — Context Bridge (cross-chat)
+- [x] v4.5 — Semantic search (PyTorch)
+- [x] **v4.6 — ONNX Runtime (×3 скорость, ×7 меньше)**
+- [ ] v4.7 — Background consolidation (dream phase)
+- [ ] v4.8 — Conflict resolution между фактами
+- [ ] v5.0 — Мультиязычные эмбеддинги + авто-перевод
+
+---
+
+## 🤝 Contributing
+
+PR welcome. Если нашли баг — создайте issue с:
+1. Вывод `docker logs memory-proxy`
+2. Запрос, который сломался
+3. Версия (`docker inspect memory-proxy | grep Image`)
+
+---
+
+## 📄 License
+
+MIT © [fastforsage](https://github.com/fastforsage)
+
+---
