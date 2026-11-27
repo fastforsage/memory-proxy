@@ -2,8 +2,8 @@
 """Управление базой memory-proxy (v4.8+).
 
     python manage.py stats                     # пользователи и объём данных
-    python manage.py facts <user>              # актуальные факты пользователя
-    python manage.py export <user> [file]      # всё о пользователе в JSON (stdout или файл)
+    python manage.py facts [user]              # актуальные факты (по умолчанию — OWNER, обычно 'default')
+    python manage.py export [user] [file]      # всё о пользователе в JSON (stdout или файл)
     python manage.py reassign <from> <to>      # перенести данные (например, 'default' → id из Open WebUI)
     python manage.py merge --into <owner>      # слить данные всех пользователей в одного (USER_MODE=single)
     python manage.py purge <user> --yes        # удалить всё о пользователе
@@ -20,10 +20,11 @@ import sys
 import time
 
 DB_PATH = os.getenv("DB_PATH", "/data/memory.db")
+OWNER = (os.getenv("OWNER", "") or "default").strip()[:128]
 USER_TABLES = ("messages", "facts", "emotions", "style_examples")
 CONTEXT_TABLES = ("chat_chain", "chat_epochs", "pinned_deltas")      # v5: состояние окон чатов
 # Должно совпадать с proxy.SINGLE_VALUED (manage.py не импортирует proxy, чтобы не грузить модель)
-SINGLE_VALUED = {"works_at", "lives_in", "age", "birthday", "partner_name", "current_project"}
+SINGLE_VALUED = {"name", "works_at", "lives_in", "age", "birthday", "partner_name", "current_project"}
 
 
 def _tables(c, names):
@@ -208,14 +209,18 @@ def main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         print(__doc__); return 0
     cmd, args = argv[1], argv[2:]
-    table = {"stats": (cmd_stats, 0, 0), "users": (cmd_stats, 0, 0), "facts": (cmd_facts, 1, 1),
-             "export": (cmd_export, 1, 2), "reassign": (cmd_reassign, 2, 2), "purge": (cmd_purge, 1, 2),
+    table = {"stats": (cmd_stats, 0, 0), "users": (cmd_stats, 0, 0), "facts": (cmd_facts, 0, 1),
+             "export": (cmd_export, 0, 2), "reassign": (cmd_reassign, 2, 2), "purge": (cmd_purge, 1, 2),
              "reindex": (cmd_reindex, 0, 0), "merge": (cmd_merge, 2, 2)}
     if cmd not in table:
-        print(__doc__); return 2
+        print(f"❌ Неизвестная команда: {cmd}. Список команд: python manage.py --help", file=sys.stderr); return 2
     fn, lo, hi = table[cmd]
+    if cmd in ("facts", "export") and not args:
+        args = [OWNER]                   # USER_MODE=single: всё принадлежит владельцу
     if not lo <= len(args) <= hi:
-        print(__doc__); return 2
+        usage = next((l.strip() for l in __doc__.splitlines() if l.strip().startswith(f"python manage.py {cmd} ")), "")
+        print(f"❌ Неверные аргументы для {cmd}. Использование: {usage or 'python manage.py --help'}", file=sys.stderr)
+        return 2
     if cmd == "purge" and len(args) == 1:
         args.append("")
     fn(connect(), *args)

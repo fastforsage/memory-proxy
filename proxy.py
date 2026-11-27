@@ -1,4 +1,4 @@
-import os, re, json, time, math, hmac, random, hashlib, sqlite3, asyncio, logging, threading
+import os, re, json, time, math, hmac, random, difflib, hashlib, sqlite3, asyncio, logging, threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import anyio
@@ -10,11 +10,12 @@ import onnxruntime as ort
 from tokenizers import Tokenizer
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.datastructures import Headers
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 import context as cx
 
-VERSION = "5.0.0"
+VERSION = "5.0.1"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -93,6 +94,8 @@ WARMUP = os.getenv("WARMUP", "1") == "1"
 BACKGROUND_PREEMPT = os.getenv("BACKGROUND_PREEMPT", "1") == "1"
 RECALL = os.getenv("RECALL", "1") == "1"
 RECALL_K = max(0, int(os.getenv("RECALL_K", "3")))
+# Извлечение фактов, вытесненное запросами пользователя, повторяется, пока не пройдёт это время (сек)
+COLD_RETRY_S = max(0.0, _env_float("COLD_RETRY_S", 1800.0))
 try:
     MODEL_PROFILES = json.loads(os.getenv("MODEL_PROFILES", "") or "{}")
     if not isinstance(MODEL_PROFILES, dict): raise ValueError
@@ -110,15 +113,49 @@ EMB_SCHEMA_VERSION = SCHEMA_VERSION
 EMO_DECAY_PER_DAY = 0.023      # период полураспада ~30 дней
 RETENTION_INTERVAL = 6 * 3600
 
-SINGLE_VALUED = {"works_at", "lives_in", "age", "birthday", "partner_name", "current_project"}
+SINGLE_VALUED = {"name", "works_at", "lives_in", "age", "birthday", "partner_name", "current_project"}
 MULTI_VALUED = {"likes", "dislikes", "knows_language", "uses_tool", "has_skill", "has_pet", "owns", "interested_in"}
 ALLOWED_PREDICATES = SINGLE_VALUED | MULTI_VALUED
+# Описания для промпта извлечения: без них малые модели придумывают свои предикаты (city, job, pet…)
+PREDICATE_HELP = {
+    "name": "имя пользователя", "age": "возраст", "birthday": "день рождения",
+    "lives_in": "город или страна, где живёт", "works_at": "компания или место работы",
+    "current_project": "над чем сейчас работает", "partner_name": "имя партнёра, мужа или жены",
+    "has_pet": "домашнее животное (вид и кличка)", "owns": "чем владеет (машина, жильё, техника)",
+    "knows_language": "язык, который знает", "uses_tool": "программа, сервис или инструмент, которым пользуется",
+    "has_skill": "умение или профессия", "likes": "что нравится", "dislikes": "что не нравится",
+    "interested_in": "интересы и хобби"}
+# Частые «самодельные» предикаты моделей → допустимые
+PREDICATE_ALIASES = {
+    "city": "lives_in", "location": "lives_in", "lives": "lives_in", "home": "lives_in", "residence": "lives_in",
+    "country": "lives_in", "job": "works_at", "work": "works_at", "company": "works_at", "employer": "works_at",
+    "workplace": "works_at", "works_for": "works_at", "pet": "has_pet", "pets": "has_pet",
+    "language": "knows_language", "languages": "knows_language", "speaks": "knows_language",
+    "skill": "has_skill", "skills": "has_skill", "profession": "has_skill", "occupation": "has_skill",
+    "tool": "uses_tool", "tools": "uses_tool", "uses": "uses_tool", "hobby": "interested_in",
+    "hobbies": "interested_in", "interest": "interested_in", "interests": "interested_in",
+    "like": "likes", "loves": "likes", "favorite": "likes", "dislike": "dislikes", "hates": "dislikes",
+    "project": "current_project", "partner": "partner_name", "spouse": "partner_name", "wife": "partner_name",
+    "husband": "partner_name", "user_name": "name", "first_name": "name", "birth_date": "birthday",
+    "birthdate": "birthday", "has": "owns", "possession": "owns"}
+
+def norm_predicate(pred) -> str:
+    if not isinstance(pred, str): return ""
+    p = re.sub(r"[\s\-]+", "_", pred.strip().lower())
+    return p if p in ALLOWED_PREDICATES else PREDICATE_ALIASES.get(p, "")
 
 SERVICE_PATTERNS = ("### Task:", "Predict 3-5 useful messages", "Generate 1-3 broad tags",
                     "Generate a concise", "Generate a title", "Suggest 3-5",
                     # LibreChat, SillyTavern и др.: заголовки и подсказки
                     "5-word-or-less title", "title for the conversation", "Create a short title",
-                    "[Pause your roleplay", "summarize the conversation so far in") + tuple(_env_list("SERVICE_PATTERNS"))
+                    "[Pause your roleplay", "summarize the conversation so far in",
+                    # Open WebUI: эмодзи для голосового режима, объединение ответов нескольких моделей (MoA)
+                    "reflect the speaker's likely facial expression", "responses from various models to the latest user query",
+                    ) + tuple(_env_list("SERVICE_PATTERNS"))
+# Служебный system-промпт: Open WebUI выбирает инструменты отдельным запросом (system — список инструментов,
+# user — «Query: …» или «History: … Query: …»). Такой запрос — не реплика пользователя.
+SERVICE_SYSTEM_PATTERNS = ("Your task is to choose and return the correct tool(s) from the list of available tools",
+                           ) + tuple(_env_list("SERVICE_SYSTEM_PATTERNS"))
 # Короткий служебный запрос без истории: «сделай заголовок/теги» на английском с малым max_tokens
 SERVICE_HINT = re.compile(r"\b(title|tags?|follow-?up|summar(y|ize))\b", re.I)
 # Обёртки агентных клиентов (Cline, Roo, Aider…): вырезаются перед анализом и поиском памяти
@@ -131,6 +168,16 @@ CROSS_CHAT_TRIGGERS = re.compile(
     r"мы с тобой)\b", re.I)
 # Только точные команды. "/help me ...", "/chats are ...", "/etc/hosts" уходят в LLM.
 COMMAND_RE = re.compile(r"^/(?:(chats|help|facts)|(pull|search|forget)(?:\s+(.+))?)\s*$", re.I | re.S)
+COMMANDS = ("chats", "help", "facts", "pull", "search", "forget")
+# Опечатка в команде («/fact», «/serch кот»): слово, очень похожее на команду, — подсказка вместо ответа модели
+NEAR_COMMAND_RE = re.compile(r"^/([a-z]{2,10})(\s+\S.*)?$", re.I | re.S)
+
+def near_command(text: str) -> str:
+    """«/fact», «/forgt 3» → «facts», «forget». С аргументами порог строже: «/imagine кот» — команда другого бота."""
+    m = NEAR_COMMAND_RE.match(text.strip())
+    if not m or m.group(1).lower() in COMMANDS: return ""     # «/help me write…» — точная команда с текстом: в модель
+    hit = difflib.get_close_matches(m.group(1).lower(), COMMANDS, n=1, cutoff=0.85 if m.group(2) else 0.75)
+    return hit[0] if hit else ""
 PRAISE = re.compile(r"\b(спасибо|благодарю|отлично|супер|класс\w*|здорово|круто|молодец|правильно|верно|хорошо)\b", re.I)
 CRITIQUE = re.compile(r"\b(туп\w*|глуп\w*|плохо|неправильно|неверно|ошиб\w*|бред\w*|чушь|бесполезн\w*|ужасн\w*)\b"
                       r"|\bне\s+(так|то|хорошо|правильно|верно|работает)\b", re.I)
@@ -148,8 +195,11 @@ def safe_float(val, default=0.0, min_val=-1.0, max_val=1.0):
     try: return max(min_val, min(max_val, float(val)))
     except (ValueError, TypeError): return default
 
-def is_service_request(text: str, body: dict = None, n_messages: int = 0) -> bool:
+def is_service_request(text: str, body: dict = None, n_messages: int = 0, sys_msgs: list = None) -> bool:
     if any(p in text for p in SERVICE_PATTERNS): return True
+    if sys_msgs and n_messages <= 1:
+        sys_text = " ".join(cx.content_text(m.get("content")) for m in sys_msgs)
+        if any(p in sys_text for p in SERVICE_SYSTEM_PATTERNS): return True
     # эвристика: один вопрос без истории, малый лимит ответа, английская просьба о заголовке/тегах
     if body is not None and n_messages <= 1:
         mt = body.get("max_tokens") or body.get("max_completion_tokens")
@@ -208,13 +258,85 @@ def _all_stems_in(phrase: str, haystack: str) -> bool:
     st = _stems(phrase)
     return all(s in haystack for s in st) if st else phrase.lower() in haystack
 
+def _cp(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y: break
+        n += 1
+    return n
+
+def _obj_in(obj: str, quote: str) -> bool:
+    """Значение факта есть в цитате как слово с учётом окончаний: «Казань» ↔ «Казани», «Маша» ↔ «Машей»,
+    но не «любил» ↔ «любимый» — общее начало должно покрывать и слово значения, и слово цитаты."""
+    qw = re.findall(r"\w+", quote.lower().replace("ё", "е"))
+    ow = [w for w in re.findall(r"\w+", obj.lower().replace("ё", "е")) if len(w) >= 3]
+    if not ow: return obj.strip().lower() in quote.lower()
+    for o in ow:
+        for w in qw:
+            c = _cp(o, w)
+            if c >= max(3, len(o) - 2) and (c >= 0.6 * len(w) or c == len(o)):   # «бег» ↔ «бегать»
+                return True
+    return False
+
+def _norm_q(t: str) -> str:
+    return re.sub(r"\s+", " ", t.lower().replace("ё", "е")).strip()
+
+def match_evidence(text: str, ev, obj):
+    """Цитата из текста (≥ 8 символов), в которой есть объект факта; None — факт отклоняется.
+
+    Цитата должна быть в тексте дословно. Мелкие расхождения модели («Я работаю в Яндексе» при тексте
+    «…, работаю в Яндексе») допускаются: берётся самый длинный общий фрагмент, если он ≥ 8 символов и
+    покрывает ≥ 60% цитаты. Объект ищется уже в найденном фрагменте, поэтому «в Google меня не взяли» не
+    станет фактом works_at: Google по цитате «работаю в Яндексе»."""
+    if not isinstance(ev, str) or not isinstance(obj, str): return None
+    tl, evl, objl = _norm_q(text), _norm_q(ev), obj.strip().lower().replace("ё", "е")
+    if len(evl) < 8 or not objl: return None
+    if evl in tl:
+        return evl if _obj_in(objl, evl) else None
+    sm = difflib.SequenceMatcher(None, tl, evl, autojunk=False)
+    m = sm.find_longest_match(0, len(tl), 0, len(evl))
+    if m.size >= 8 and m.size >= 0.6 * len(evl):
+        quote = tl[m.a:m.a + m.size].strip()
+        if _obj_in(objl, quote): return quote
+    # модель вставила или пропустила слово («я живу в городе Казани»): фрагмент текста от первого до последнего
+    # совпадения, если совпало ≥ 60% цитаты и фрагмент не намного длиннее неё
+    blocks = [b for b in sm.get_matching_blocks() if b.size >= 3]
+    if not blocks: return None
+    matched = sum(b.size for b in blocks)
+    start, end = blocks[0].a, blocks[-1].a + blocks[-1].size
+    if matched < 8 or matched < 0.6 * len(evl) or end - start > 1.5 * len(evl) + 10: return None
+    quote = tl[start:end].strip()
+    return quote if _obj_in(objl, quote) else None
+
+NEGATION = re.compile(r"(?<!\w)(не|нет|ни|больше не|not|never|no longer|don't|doesn't|didn't|isn't|wasn't|won't)(?!\w)", re.I)
+CLAUSE_SPLIT = re.compile(r"[,.;:!?]|\s(?:а|но|однако|but|however)\s", re.I)
+
+def negated(quote: str, obj: str) -> bool:
+    """Объект факта стоит в отрицании: «в Google меня не взяли», «я больше не живу в Москве»."""
+    for clause in CLAUSE_SPLIT.split(quote):
+        if _any_stem_in(obj, clause.lower()) and NEGATION.search(clause):
+            return True
+    return False
+
+SELF_REF = re.compile(r"(?<!\w)(я|меня|мне|мной|мой|моя|моё|мое|мои|моего|моей|моим|моих|зовут|i|i'm|im|me|my|mine|myself)(?!\w)", re.I)
+NAME_INTRO = re.compile(r"(?:(?<!\w)(?:меня\s+зовут|зовите\s+меня|зови\s+меня|мо[её]\s+имя|имя|я|my\s+name\s+is|my\s+name's|call\s+me|i\s+am|i'm|im|it's|this\s+is))"
+                        r"\s*[—–:,-]?\s*$", re.I)
+
+def name_ok(quote: str, obj: str) -> bool:
+    """name — только самопредставление: «меня зовут Оля», «я — Оля», «call me John». Не «с женой Машей»."""
+    ql = quote.lower()
+    for st in _stems(obj)[:1]:
+        for m in re.finditer(re.escape(st), ql):
+            if NAME_INTRO.search(ql[max(0, m.start() - 30):m.start()]):
+                return True
+    return False
+
+def self_ref(quote: str) -> bool:
+    return bool(SELF_REF.search(quote))
+
 def evidence_ok(text: str, ev, obj) -> bool:
-    """Цитата ≥ 8 символов дословно из текста, и объект факта должен быть в самой цитате."""
-    if not isinstance(ev, str) or not isinstance(obj, str): return False
-    ev, obj = ev.strip().lower(), obj.strip().lower()
-    if len(ev) < 8 or not obj: return False
-    if ev not in text.lower(): return False
-    return _any_stem_in(obj, ev)
+    """Цитата ≥ 8 символов из текста, и объект факта должен быть в самой цитате."""
+    return match_evidence(text, ev, obj) is not None
 
 # ─── Глобальное состояние ───
 _conn = None
@@ -525,6 +647,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="memory-proxy", version=VERSION)
 
+# ─── Ошибки в формате OpenAI ───
+# Клиенты (OpenAI SDK, Open WebUI, LibreChat) показывают пользователю error.message; на {"detail": …} или строку
+# в "error" SDK пишет только «Error code: 401». "detail" оставлен для клиентов, которые читают его.
+_ERR_TYPE = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error",
+             413: "invalid_request_error", 415: "invalid_request_error", 429: "rate_limit_error"}
+
+def error_response(msg: str, status: int, code: str = None) -> Response:
+    err = {"message": msg, "type": _ERR_TYPE.get(status, "server_error" if status >= 500 else "invalid_request_error"),
+           "code": code or status}
+    return Response(orjson.dumps({"error": err, "detail": msg}), status_code=status, media_type="application/json")
+
+@app.exception_handler(HTTPException)
+async def _http_error(request: Request, exc: HTTPException):
+    resp = error_response(str(exc.detail), exc.status_code)
+    for k, v in (exc.headers or {}).items(): resp.headers[k] = v
+    return resp
+
 # CORS: выключен по умолчанию; "*" допустим только вместе с ключом
 _origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()] if CORS_ORIGINS else []
 if _origins:
@@ -533,11 +672,29 @@ if _origins:
     app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["POST", "GET"], allow_headers=["*"])
     log.info(f"CORS enabled: {_origins}")
 
+class HostCheck(TrustedHostMiddleware):
+    """TrustedHostMiddleware с понятной ошибкой: клиент видит, какое имя добавить в ALLOWED_HOSTS, а в логе —
+    предупреждение (раньше был голый текст «Invalid host header»)."""
+    warned = set()
+
+    async def __call__(self, scope, receive, send):
+        if self.allow_any or scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        host = Headers(scope=scope).get("host", "").split(":")[0]
+        if any(host == p or (p.startswith("*") and host.endswith(p[1:])) for p in self.allowed_hosts):
+            return await self.app(scope, receive, send)
+        if host not in self.warned and len(self.warned) < 100:
+            self.warned.add(host)
+            log.warning(f"Rejected request for Host '{host}': add it to ALLOWED_HOSTS (now: {','.join(self.allowed_hosts)})")
+        msg = (f"memory-proxy: host '{host}' is not allowed. Add it to ALLOWED_HOSTS "
+               f"(MEMORY_PROXY_ALLOWED_HOSTS in docker-compose), or use one of: {', '.join(self.allowed_hosts)}")
+        await error_response(msg, 400, "invalid_host")(scope, receive, send)
+
 # Защита от DNS rebinding: принимаем только известные Host. Добавляется последним → внешний слой.
 if "*" in ALLOWED_HOSTS:
     log.warning("ALLOWED_HOSTS='*': Host header validation disabled (DNS rebinding protection off)")
 else:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+    app.add_middleware(HostCheck, allowed_hosts=ALLOWED_HOSTS)
 
 # ─── Аутентификация и идентификация ───
 def check_auth(request: Request):
@@ -551,7 +708,8 @@ def check_auth(request: Request):
         if hmac.compare_digest(tb, key.encode("utf-8")): matched = user
     if matched: return matched
     if API_KEY and hmac.compare_digest(tb, API_KEY.encode("utf-8")): return None
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    raise HTTPException(status_code=401, detail=("memory-proxy: missing API key (Authorization: Bearer …). " if not token else
+                                                "memory-proxy: invalid API key. ") + "Use the value of API_KEY (MEMORY_PROXY_API_KEY in docker-compose).")
 
 def _clean_id(v, n: int = 128) -> str:
     return v.strip()[:n] if isinstance(v, str) and v.strip() else ""
@@ -575,7 +733,8 @@ def check_not_cross_site(request: Request):
     а preflight без CORS не пройдёт. Серверные клиенты (Open WebUI, curl) всегда шлют application/json."""
     ct = request.headers.get("content-type", "").split(";")[0].strip().lower()
     if ct != "application/json":
-        raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+        raise HTTPException(status_code=415, detail="memory-proxy: Content-Type must be application/json "
+                                                    "(curl: add -H 'Content-Type: application/json').")
     if request.headers.get("sec-fetch-site", "") in ("cross-site", "same-site"):
         origin = request.headers.get("origin", "")
         if "*" not in _origins and origin not in _origins:
@@ -836,11 +995,24 @@ def run_command(user_id: str, chat_id: str, cmd: str, arg: str) -> str:
     return HELP_TEXT
 
 # ─── Стиль ───
+def _style_key(text: str) -> str:
+    return re.sub(r"\W+", " ", text.lower())[:300].strip()
+
 def save_style_example(user_id: str, chat_id: str, text: str, pre_type: str):
     if len(text) < 80 or len(text) > 2000: return
     ctx = pre_type if pre_type in ("personal", "mixed", "technical") else "mixed"
     try:
         with _conn:
+            # Модель повторила пример дословно — пример вреден (малые модели копируют его вместо ответа,
+            # и копия снова попадала бы в примеры): пример удаляется, копия не сохраняется.
+            key = _style_key(text)
+            for ex_id, ex_text in _conn.execute("SELECT id, text FROM style_examples WHERE user_id=?", (user_id,)).fetchall():
+                k2 = _style_key(ex_text)
+                if key == k2 or difflib.SequenceMatcher(None, key, k2, autojunk=False).ratio() > 0.9:
+                    _conn.execute("DELETE FROM style_examples WHERE id=?", (ex_id,))
+                    log.info("[Style] the model repeated a style example verbatim: example removed")
+                    LAST_EXAMPLE_ID.pop((user_id, chat_id), None)
+                    return
             cur = _conn.execute("INSERT INTO style_examples(user_id, text, context, score, ts) VALUES (?,?,?,0,?)",
                                 (user_id, text[:1000], ctx, time.time()))
             _conn.execute("DELETE FROM style_examples WHERE user_id=? AND context=? AND id NOT IN (SELECT id FROM style_examples "
@@ -884,23 +1056,30 @@ def apply_analysis(data: dict, text: str, user_id: str, chat_id: str, msg_id: in
     now = time.time()
     scope = scope_of(chat_id)
     scope_sql, scope_p = ("", []) if GLOBAL_MEMORY else (" AND scope = ?", [scope])
-    new_facts = []
+    new_facts, rejected = [], {"predicate": 0, "quote": 0, "negation": 0, "self": 0, "format": 0}
     with _conn:
         msg_type = data.get("type", "unknown")
         if not isinstance(msg_type, str): msg_type = "unknown"
         if pre_type == "technical": msg_type = "technical"
         _conn.execute("UPDATE messages SET content_type=? WHERE id=?", (msg_type[:20], msg_id))
-        if msg_type == "technical":
+        if pre_type == "technical":
             return []
+        # Маленькие модели часто зовут «technical» сообщение «я программист, пишу на Python» —
+        # тогда факты не выбрасываем, но принимаем только цитаты от первого лица.
+        llm_technical = msg_type == "technical"
 
         text_l = text.lower()
         facts = data.get("facts", [])
         for f in facts if isinstance(facts, list) else []:
-            if not isinstance(f, dict): continue
-            ev, pred = f.get("evidence"), f.get("predicate")
-            if not isinstance(pred, str) or pred not in ALLOWED_PREDICATES: continue
+            if not isinstance(f, dict): rejected["format"] += 1; continue
+            pred = norm_predicate(f.get("predicate"))
+            if not pred: rejected["predicate"] += 1; continue
             obj = re.sub(r"[\[\]\n\r<>]", " ", str(f.get("object", ""))[:50]).strip()
-            if not evidence_ok(text, ev, obj): continue
+            ev = match_evidence(text, f.get("evidence"), obj)
+            if ev is None: rejected["quote"] += 1; continue
+            if pred != "dislikes" and negated(ev, obj): rejected["negation"] += 1; continue
+            if (llm_technical and not self_ref(ev)) or (pred == "name" and not name_ok(ev, obj)):
+                rejected["self"] += 1; continue
 
             if pred in SINGLE_VALUED:
                 invalidate_and_clean_vec(user_id, scope, pred, obj, now)
@@ -913,12 +1092,12 @@ def apply_analysis(data: dict, text: str, user_id: str, chat_id: str, msg_id: in
                 try:
                     cur = _conn.execute(
                         "INSERT INTO facts(user_id,scope,chat_id,predicate,object,evidence,ts,valid_from) VALUES (?,?,?,?,?,?,?,?)",
-                        (user_id, scope, chat_id, pred, obj, ev.strip(), now, now))
+                        (user_id, scope, chat_id, pred, obj, ev, now, now))
                     new_facts.append((cur.lastrowid, f"{pred}: {obj}"))
                 except sqlite3.IntegrityError:
                     pass
 
-        emotions = data.get("emotions", [])
+        emotions = data.get("emotions", []) if not llm_technical else []
         for e in emotions if isinstance(emotions, list) else []:
             if not isinstance(e, dict): continue
             trigger = re.sub(r"[<>\n\r]", " ", str(e.get("trigger", ""))).strip()[:30]
@@ -937,6 +1116,10 @@ def apply_analysis(data: dict, text: str, user_id: str, chat_id: str, msg_id: in
             else:
                 _conn.execute("INSERT INTO emotions(user_id,scope,trigger,score,mention_count,last_seen,last_quote) "
                               "VALUES (?,?,?,?,1,?,?)", (user_id, scope, trigger, val, now, quote[:100]))
+    if any(rejected.values()):
+        # «Почему не запомнил?» — видно в логе без DEBUG
+        log.info(f"[Cold] facts rejected: unknown predicate {rejected['predicate']}, no quote from the message "
+                 f"{rejected['quote']}, negated {rejected['negation']}, not about user {rejected['self']}, bad format {rejected['format']} (accepted {len(new_facts)})")
     return new_facts
 
 def insert_vectors(user_id: str, new_facts: list, embs: list):
@@ -949,14 +1132,29 @@ def insert_vectors(user_id: str, new_facts: list, embs: list):
                           [(fid, user_id, e) for (fid, _), e in zip(new_facts, embs) if fid in alive])
 
 def build_extract_payload(text: str, original_model: str = "") -> dict:
-    prompt = f"""Проанализируй текст. Верни ТОЛЬКО JSON.
-{{"type": "personal|technical",
-  "facts": [{{"predicate": "key", "object": "value", "evidence": "цитата"}}],
-  "emotions": [{{"trigger": "тема", "valence": 0.0, "quote": "цитата"}}]}}
-Доступные predicate: {", ".join(sorted(ALLOWED_PREDICATES))}.
-evidence и quote — дословные фрагменты текста. type=technical → пустые facts/emotions.
-Текст: "{text[:4000]}"
-"""
+    preds = "\n".join(f"- {k}: {v}" for k, v in PREDICATE_HELP.items())
+    prompt = f"""Извлеки факты о пользователе из его сообщения. Ответь только JSON.
+
+Предикаты:
+{preds}
+
+Правила:
+- object — слова из сообщения, на языке сообщения, без перевода.
+- evidence — точная копия фрагмента сообщения, где сказан факт.
+- Только то, что пользователь сказал о себе. Нет фактов — "facts": [].
+- type: "technical", если сообщение о коде или технической задаче, иначе "personal".
+- emotions — темы, к которым пользователь выразил отношение; valence от -1 до 1; quote — точная цитата.
+
+Пример.
+Сообщение: "Я Оля, переехала в Тверь. Обожаю бег, а вот пробки ненавижу."
+Ответ: {{"type": "personal", "facts": [{{"predicate": "name", "object": "Оля", "evidence": "Я Оля"}}, \
+{{"predicate": "lives_in", "object": "Тверь", "evidence": "переехала в Тверь"}}, \
+{{"predicate": "likes", "object": "бег", "evidence": "Обожаю бег"}}, \
+{{"predicate": "dislikes", "object": "пробки", "evidence": "пробки ненавижу"}}], \
+"emotions": [{{"trigger": "пробки", "valence": -0.8, "quote": "пробки ненавижу"}}]}}
+
+Сообщение: "{text[:4000]}"
+Ответ:"""
     payload = {"messages": [{"role": "user", "content": prompt}],
                "temperature": 0.1, "response_format": {"type": "json_object"},
                "max_tokens": EXTRACT_MAX_TOKENS}     # малые модели в JSON-режиме зацикливаются на пробелах
@@ -970,9 +1168,10 @@ async def cold_analyze(text: str, user_id: str, chat_id: str, msg_id: int, pre_t
         try:
             # фоновая задача: не занимает слот модели, пока пользователь ждёт ответа (BackgroundGate)
             payload = build_extract_payload(text, original_model)
-            r = await GATE.run(lambda: http.post(EXTRACT_URL, json=payload, timeout=300.0))
+            r = await GATE.run(lambda: http.post(EXTRACT_URL, json=payload, timeout=300.0),
+                               deadline=time.monotonic() + COLD_RETRY_S)
             if r is None:
-                log.warning("[Cold] skipped: model stayed busy with user requests"); return
+                log.warning(f"[Cold] skipped: model stayed busy with user requests for {COLD_RETRY_S:.0f} s"); return
             if r.status_code != 200:
                 log.warning(f"[Cold] LLM status={r.status_code}: {r.text[:200]}")
                 return
@@ -1011,11 +1210,22 @@ def save_user_message(user_id: str, chat_id: str, text: str, pre_type: str):
                             (user_id, chat_id, "user", text, time.time(), pre_type))
     return cur.lastrowid
 
-def save_assistant_message(user_id: str, chat_id: str, text: str, pre_type: str):
+def save_assistant_message(user_id: str, chat_id: str, text: str, pre_type: str, replace: bool = False,
+                           style: bool = True):
+    """replace — ответ на «Регенерировать»: заменяет прежний ответ на тот же вопрос, а не добавляет второй.
+    Прежний пример стиля удаляется: перегенерация — знак, что ответ не понравился. style=False — ответ обрезан
+    по max_tokens: в историю идёт, в примеры стиля нет."""
     with _conn:
-        _conn.execute("INSERT INTO messages(user_id,chat_id,role,content,ts,content_type) VALUES (?,?,?,?,?,?)",
-                      (user_id, chat_id, "assistant", text, time.time(), "assistant"))
-    save_style_example(user_id, chat_id, text, pre_type)
+        last = _conn.execute("SELECT id, role FROM messages WHERE user_id=? AND chat_id=? ORDER BY id DESC LIMIT 1",
+                             (user_id, chat_id)).fetchone() if replace else None
+        if last and last[1] == "assistant":
+            _conn.execute("UPDATE messages SET content=?, ts=? WHERE id=?", (text, time.time(), last[0]))
+            ex_id = LAST_EXAMPLE_ID.pop((user_id, chat_id), None)
+            if ex_id: _conn.execute("DELETE FROM style_examples WHERE id=? AND user_id=?", (ex_id, user_id))
+        else:
+            _conn.execute("INSERT INTO messages(user_id,chat_id,role,content,ts,content_type) VALUES (?,?,?,?,?,?)",
+                          (user_id, chat_id, "assistant", text, time.time(), "assistant"))
+    if style: save_style_example(user_id, chat_id, text, pre_type)
 
 # ─── v5: пользователи и чаты ───
 def header_chat_id(request: Request) -> str:
@@ -1370,8 +1580,10 @@ def load_state(user_id: str, chat_id: str, hashes: list, memory_default: bool) -
 
 # ─── v5: фоновые задачи уступают пользователю ───
 class BackgroundGate:
-    """Фоновые LLM-запросы (саммари, прогрев) ждут, пока нет пользовательских запросов, и отменяются,
-    когда пользовательский запрос приходит (BACKGROUND_PREEMPT): у локальной модели один слот."""
+    """Фоновые LLM-запросы (извлечение фактов, саммари, прогрев) ждут, пока нет пользовательских запросов, и
+    отменяются, когда пользовательский запрос приходит (BACKGROUND_PREEMPT): у локальной модели один слот.
+    Слэш-команды модель не используют и фон не трогают. Служебные запросы клиента (заголовок, теги) тоже
+    вытесняют фон; извлечение фактов после вытеснения повторяется до COLD_RETRY_S, а не теряется."""
     def __init__(self):
         self.active, self.running, self.idle = 0, set(), None
 
@@ -1380,17 +1592,21 @@ class BackgroundGate:
             self.idle = asyncio.Event(); self.idle.set()
         return self.idle
 
-    def user_start(self):
+    def user_start(self, preempt: bool = True):
         self.active += 1; self._ev().clear()
-        if BACKGROUND_PREEMPT:
+        if BACKGROUND_PREEMPT and preempt:
             for t in list(self.running): t.cancel()
 
     def user_end(self):
         self.active = max(0, self.active - 1)
         if not self.active: self._ev().set()
 
-    async def run(self, factory, attempts: int = 4):
-        for _ in range(attempts):
+    async def run(self, factory, attempts: int = 4, deadline: float = 0):
+        """attempts — сколько раз пробовать после вытеснения; deadline > 0 — пробовать до этого момента
+        (time.monotonic), сколько бы раз ни вытесняли."""
+        n = 0
+        while n < attempts or (deadline and time.monotonic() < deadline):
+            n += 1
             await self._ev().wait()
             t = asyncio.ensure_future(factory())
             self.running.add(t)
@@ -1636,8 +1852,17 @@ async def fit_oversize(plan: Plan, e: dict, msgs: list, deltas_text: dict):
     return msgs[:sys_n] + shrunk, e
 
 # ─── HTTP ───
-def json_error(msg: str, status: int) -> Response:
-    return Response(orjson.dumps({"error": msg}), status_code=status, media_type="application/json")
+def json_error(msg: str, status: int, code: str = None) -> Response:
+    return error_response(msg, status, code)
+
+def backend_error(e: Exception, what: str = "LLM backend") -> Response:
+    """Бэкенд недоступен: пользователь видит, куда прокси пытался подключиться и что проверить."""
+    if isinstance(e, httpx.TimeoutException):
+        msg = f"memory-proxy: the {what} at {BACKEND_BASE} did not answer in time ({type(e).__name__})."
+        return error_response(msg, 504, "backend_timeout")
+    msg = (f"memory-proxy: cannot reach the {what} at {BACKEND_BASE} ({type(e).__name__}: {e}). "
+           "Check that the model server is running and that LLAMA_URL points to it.")
+    return error_response(msg, 502, "backend_unavailable")
 
 def _usage_of(d: dict):
     u = d.get("usage") if isinstance(d.get("usage"), dict) else None
@@ -1645,7 +1870,7 @@ def _usage_of(d: dict):
     return u, t
 
 async def forward(http: httpx.AsyncClient, body: dict, on_complete=None, on_usage=None, on_finish=None) -> Response:
-    """Проксирует запрос в LLM (stream и non-stream). on_complete(text) — полный ответ, on_usage(usage, timings) —
+    """Проксирует запрос в LLM (stream и non-stream). on_complete(text, finish_reason) — полный ответ, on_usage(usage, timings) —
     статистика промпта, on_finish() — запрос завершён (после стрима)."""
     def finish():
         if on_finish is not None:
@@ -1656,7 +1881,7 @@ async def forward(http: httpx.AsyncClient, body: dict, on_complete=None, on_usag
             req = http.build_request("POST", LLAMA_URL, json=body)
             upstream = await http.send(req, stream=True)
         except httpx.HTTPError as e:
-            finish(); return json_error(str(e), 502)
+            finish(); return backend_error(e)
         if upstream.status_code != 200:
             err_body = await upstream.aread()
             await upstream.aclose()
@@ -1665,30 +1890,44 @@ async def forward(http: httpx.AsyncClient, body: dict, on_complete=None, on_usag
                             media_type=upstream.headers.get("content-type", "application/json"))
 
         async def relay():
-            acc, buf, usage, timings = [], b"", None, None
+            acc, buf, usage, timings, failed, finish_reason = [], b"", None, None, False, None
             try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-                    if on_complete is None and on_usage is None: continue
-                    buf += chunk
-                    while b"\n" in buf:
-                        raw, buf = buf.split(b"\n", 1)
-                        line = raw.decode("utf-8", "ignore").strip()
-                        if line.startswith("data:") and line != "data: [DONE]":
-                            try:
-                                d = orjson.loads(line[5:].strip().encode())
-                                ch = d.get("choices") or [{}]
-                                acc.append((ch[0].get("delta") or {}).get("content") or "")
-                                u, t = _usage_of(d)
-                                usage, timings = u or usage, t or timings
-                            except Exception: pass
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                        if on_complete is None and on_usage is None: continue
+                        buf += chunk
+                        while b"\n" in buf:
+                            raw, buf = buf.split(b"\n", 1)
+                            line = raw.decode("utf-8", "ignore").strip()
+                            if line.startswith("data:") and line != "data: [DONE]":
+                                try:
+                                    d = orjson.loads(line[5:].strip().encode())
+                                    ch = d.get("choices") or [{}]
+                                    acc.append((ch[0].get("delta") or {}).get("content") or "")
+                                    finish_reason = ch[0].get("finish_reason") or finish_reason
+                                    u, t = _usage_of(d)
+                                    usage, timings = u or usage, t or timings
+                                except Exception: pass
+                except Exception as e:
+                    # бэкенд оборвал стрим: клиент получает ошибку и корректный конец потока, обрывок не сохраняется
+                    failed = True
+                    log.warning(f"[Stream] backend stream broke: {type(e).__name__}: {e}")
+                    err = {"message": f"memory-proxy: the LLM backend at {BACKEND_BASE} broke the stream "
+                                      f"({type(e).__name__}). The answer is incomplete, try again.",
+                           "type": "server_error", "code": "backend_stream_error"}
+                    yield b"\n\ndata: " + orjson.dumps({"error": err}) + b"\n\ndata: [DONE]\n\n"
             finally:
-                await upstream.aclose()
-                if on_complete is not None and "".join(acc):
-                    on_complete("".join(acc))
-                if on_usage is not None and (usage or timings):
-                    on_usage(usage, timings)
-                finish()
+                # Синхронная часть — до await: при отключении клиента генератор отменяют, и await aclose() может
+                # бросить CancelledError — тогда finish() не выполнился бы и фон ждал бы вечно.
+                try:
+                    if on_complete is not None and "".join(acc) and not failed:
+                        on_complete("".join(acc), finish_reason)
+                    if on_usage is not None and (usage or timings):
+                        on_usage(usage, timings)
+                finally:
+                    finish()
+                    await upstream.aclose()
 
         resp = StreamingResponse(relay(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1698,12 +1937,20 @@ async def forward(http: httpx.AsyncClient, body: dict, on_complete=None, on_usag
     try:
         r = await http.post(LLAMA_URL, json=body)
     except httpx.HTTPError as e:
-        finish(); return json_error(str(e), 502)
+        finish(); return backend_error(e)
     if r.status_code == 200:
         try:
-            j = r.json()
+            j = orjson.loads(r.content)
+        except orjson.JSONDecodeError:
+            finish()
+            log.warning(f"[Backend] invalid JSON in a 200 answer: {r.content[:200]!r}")
+            return error_response(f"memory-proxy: the LLM backend at {BACKEND_BASE} returned a broken answer "
+                                  f"(not valid JSON, {len(r.content)} bytes). Try again or check the model server log.",
+                                  502, "backend_bad_response")
+        try:
             content = j["choices"][0]["message"]["content"]
-            if on_complete is not None and isinstance(content, str) and content: on_complete(content)
+            if on_complete is not None and isinstance(content, str) and content:
+                on_complete(content, j["choices"][0].get("finish_reason"))
             u, t = _usage_of(j)
             if on_usage is not None and (u or t): on_usage(u, t)
         except Exception: pass
@@ -1732,12 +1979,37 @@ def command_response(body: dict, text: str) -> Response:
 def _ping():
     _conn.execute("SELECT 1").fetchone()
 
+BACKEND_PROBE = {"ts": 0.0, "reachable": None, "error": ""}
+
+async def probe_backend(http: httpx.AsyncClient) -> dict:
+    """Доступен ли LLM-бэкенд (кэш 15 с). На status не влияет: прокси жив и без модели (команды работают),
+    а Docker не должен перезапускать его из-за выключенной модели."""
+    now = time.monotonic()
+    if now - BACKEND_PROBE["ts"] > 15:
+        try:
+            r = await http.get(LLAMA_URL.replace("/chat/completions", "/models"), timeout=2.0)
+            BACKEND_PROBE.update(reachable=r.status_code < 500, error="" if r.status_code < 500 else f"HTTP {r.status_code}")
+        except httpx.HTTPError as e:
+            BACKEND_PROBE.update(reachable=False, error=f"{type(e).__name__}: {e}"[:200])
+        BACKEND_PROBE["ts"] = now
+    return {"url": BACKEND_BASE, "reachable": BACKEND_PROBE["reachable"], **({"error": BACKEND_PROBE["error"]} if BACKEND_PROBE["error"] else {})}
+
+@app.get("/")
+async def root():
+    """Кто открыл адрес прокси в браузере — видит, что это и куда подключать клиента, а не 404."""
+    return {"name": "memory-proxy", "version": VERSION,
+            "message": "OpenAI-compatible proxy with long-term memory. Point your chat client at this address + /v1 "
+                       "(e.g. http://localhost:8081/v1) and use API_KEY as the key. Type /help in a chat for commands.",
+            "endpoints": ["/v1/chat/completions", "/v1/models", "/health"]}
+
 @app.get("/health")
-async def health():
+async def health(request: Request):
     try:
         await asyncio.wait_for(db(_ping), timeout=5)
         hit = STATS["cached_tokens"] / STATS["prompt_tokens"] if STATS["prompt_tokens"] else None
         return {"status": True, "db": "ok", "version": VERSION, "user_mode": USER_MODE, "context_mode": CONTEXT_MODE,
+                "backend": await probe_backend(request.app.state.http),
+                "background": {"waiting_for_user_requests": GATE.active, "running": len(GATE.running)},
                 "context": {**STATS, "cache_hit": round(hit, 3) if hit is not None else None,
                             "backends": {m: {"n_ctx": i.get("n_ctx"), "src": i.get("src"), "system_mode": i.get("system_mode")}
                                          for m, i in BACKENDS.items()},
@@ -1753,33 +2025,42 @@ async def models(request: Request):
         r = await http.get(LLAMA_URL.replace("/chat/completions", "/models"), timeout=10.0)
         return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
     except httpx.HTTPError as e:
-        return json_error(str(e), 502)
+        return backend_error(e)
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     key_user = check_auth(request)
     check_not_cross_site(request)
-    GATE.user_start()
+    request.state.gate = False
     try:
         resp = await _chat(request, key_user)
     except BaseException:
-        GATE.user_end(); raise
-    if not getattr(resp, "owns_finish", False):
+        if request.state.gate: GATE.user_end()
+        raise
+    if request.state.gate and not getattr(resp, "owns_finish", False):
         GATE.user_end()
     return resp
+
+def gate_begin(request: Request, preempt: bool = True):
+    """Запрос пойдёт в модель: фон ждёт его окончания (и вытесняется, если preempt)."""
+    if not request.state.gate:
+        request.state.gate = True
+        GATE.user_start(preempt)
 
 async def _chat(request: Request, key_user):
     http: httpx.AsyncClient = request.app.state.http
     try:
         body = await request.json()
     except Exception:
-        return json_error("invalid json", 400)
+        return json_error("Request body is not valid JSON.", 400, "invalid_json")
     if not isinstance(body, dict):
-        return json_error("body must be object", 400)
+        return json_error("Request body must be a JSON object.", 400, "invalid_request")
 
     messages = body.get("messages", [])
     if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
-        return json_error("messages must be an array of objects", 400)
+        return json_error("'messages' must be an array of objects.", 400, "invalid_request")
+    if not messages:
+        return json_error("'messages' must not be empty.", 400, "invalid_request")
     user_id = resolve_user(request, body, key_user)
     sys_msgs, non_sys = cx.split_system(messages)
     lu = cx.last_user_index(non_sys)
@@ -1790,11 +2071,17 @@ async def _chat(request: Request, key_user):
     user_text = clean_client_text(raw_text) if raw_text else ""
 
     if len(raw_text) > MAX_INPUT_LEN:
-        return json_error("too long", 400)
+        return json_error(f"The message is too long: {len(raw_text)} characters, the limit is {MAX_INPUT_LEN} "
+                          "(MAX_INPUT_LEN).", 413, "message_too_long")
 
     # Служебные запросы клиентов (заголовки, теги, подсказки) — без памяти и без записи в БД
-    if is_service_request(raw_text, body, len(non_sys)):
-        return await forward(http, body, on_finish=None)
+    if is_service_request(raw_text, body, len(non_sys), sys_msgs):
+        # тоже вытесняет фон: у локальной модели один слот, и заголовок/подсказки иначе ждали бы минутами;
+        # вытесненное извлечение фактов повторится (COLD_RETRY_S), а не потеряется
+        gate_begin(request)
+        resp = await forward(http, body, on_finish=GATE.user_end)
+        resp.owns_finish = True
+        return resp
 
     hashes = cx.history_hashes(non_sys)
     chat_id, last_is_new = await db(resolve_chat, user_id, header_chat_id(request), hashes,
@@ -1811,8 +2098,14 @@ async def _chat(request: Request, key_user):
             log.error(f"Command {cmd}: {e}")
             resp_text = "❌ Ошибка выполнения команды, подробности в логе прокси."
         return command_response(body, resp_text)
+    near = near_command(raw_text) if (raw_text and not is_vision and last_user is non_sys[-1]) else ""
+    if near:
+        return command_response(body, f"❓ Команды {raw_text.split()[0][:20]} нет. Возможно, /{near}? Все команды: /help")
 
+    gate_begin(request)
     new_question = last_is_new and last_user is not None and last_user is non_sys[-1]
+    # «Регенерировать»: та же история, последний — вопрос пользователя. Новый ответ заменит прежний в истории.
+    regenerate = (not last_is_new) and last_user is not None and last_user is non_sys[-1]
     if new_question and user_text:
         await db(score_previous, user_id, chat_id, user_text)
 
@@ -1856,9 +2149,10 @@ async def _chat(request: Request, key_user):
 
     est = {"n": TOKENS.messages(out, model) + TOKENS.tools(body.get("tools"), model)}
 
-    def on_complete(full: str):
+    def on_complete(full: str, finish_reason=None):
         text = cx.strip_think(full)
-        if text: db_submit(save_assistant_message, user_id, chat_id, text, pre_type)
+        if text: db_submit(save_assistant_message, user_id, chat_id, text, pre_type, regenerate,
+                           finish_reason != "length")
 
     def on_usage(usage, timings):
         u, t = usage or {}, timings or {}
@@ -1890,7 +2184,7 @@ async def passthrough(path: str, request: Request):
     check_auth(request)
     check_not_cross_site(request)
     if not PASSTHROUGH:
-        return json_error("not found", 404)
+        return json_error(f"/v1/{path} is disabled (PASSTHROUGH=0).", 404, "not_found")
     http: httpx.AsyncClient = request.app.state.http
     headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept")}
     try:
@@ -1898,7 +2192,7 @@ async def passthrough(path: str, request: Request):
                                  content=await request.body(), headers=headers)
         up = await http.send(req, stream=True)
     except httpx.HTTPError as e:
-        return json_error(str(e), 502)
+        return backend_error(e)
     ctype = up.headers.get("content-type", "application/json")
     if "text/event-stream" in ctype:
         async def relay():
