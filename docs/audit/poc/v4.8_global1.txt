@@ -1,0 +1,60 @@
+=== v4.8.0  MODE=global1 ===
+
+[FIXED  ] C-2: CORS по умолчанию выключен (чтение ответа чужим сайтом)
+          preflight от evil.example: status=405, ACAO=None
+[FIXED  ] NEW-1: CSRF: «простой» POST text/plain с чужого сайта выполняется без preflight → отравление памяти
+          status=415; сообщений +0; внедрённый факт: []
+[FIXED  ] NEW-2: Host не валидируется → DNS-rebinding даёт same-origin доступ к прокси без API_KEY
+          /v1/models c Host=attacker-rebind.example → 400; chat → 400 (ответ модели с подмешанной памятью читается страницей)
+[FIXED  ] M-7: stream=false для команд → JSON chat.completion
+          content-type=application/json
+[FIXED  ] NEW-3: Регрессия: /chats, /pull, /search не работают — group(1) без '/', сравнение с '/chats' всегда ложно
+          ответ на '/chats': '📚 **Твои чаты:**\n1. `secret-c` (2 сообщ., 2026-11-27 08:47): Мой пароль от почты hunter2...'
+[FIXED  ] M-7: Пути вида /etc/... уходят в LLM
+          запросов к LLM: +2
+[FIXED  ] M-7: «/help me …» всё ещё перехватывается как команда
+          ответ прокси: '{"choices": [{"message": {"content": "{\\"tags\\":[\\"general\\",\\"chat\\",\\"assistan'
+[FIXED  ] H-3: Русский рассказ ~300 симв. → personal
+          preclassify=personal
+[FIXED  ] NEW-4: Новый preclassify: ложные «technical» для обычных личных сообщений (память отключается)
+          {'эмоц. RU': 'personal', 'список дел RU': 'personal', 'personal EN': 'personal', 'ссылка RU': 'personal'}
+[FIXED  ] NEW-5: Короткий код (<80 симв.) → personal; из-за этого падает tests/test_proxy.py и CI
+          preclassify('```python…```')=technical
+[FIXED  ] H-4a: Cold-запрос содержит model
+          model=m
+[FIXED  ] H-4b: Пустой evidence отклоняется
+          facts(Google)=[]
+[FIXED  ] H-4b: Evidence и object не связаны: object достаточно встретить где-то в тексте
+          сохранено: []
+[FIXED  ] H-4c: Кривой элемент не роняет весь анализ, валидные факты сохраняются атомарно
+          lives_in=[('Москва', 0), ('Казань', 1)]; факт с evidence=int сохранён: False
+[FIXED  ] M-2: Векторы устаревших фактов удаляются
+          facts=[(1, 'Москва', 0), (2, 'Казань', 1)]; устаревших в vec_facts=[]; актуальных без вектора=[]
+[FIXED  ] M-2: Backfill через LEFT JOIN восстанавливает пропавший вектор
+          (только при старте процесса)
+[FIXED  ] M-3: Префикс search_query: при поиске + автомиграция старых векторов
+          вход эмбеддера: ['search_query: Где я живу? Напомни']; PRAGMA user_version=3 (миграция при старте, cleanup_vec.py не нужен)
+[FIXED  ] M-4: Служебные запросы Open WebUI не трогают стиль и БД
+          LAST_EXAMPLE_ID 11→11; сохранённых ответов-тегов=0
+[FIXED  ] M-6: Один system в начале; в нём только статичная политика памяти, данные — в user
+          роли: ['system', 'user', 'assistant', 'user']
+[FIXED  ] H-2: Цитата из другого чата: не в system, а в блоке <memory> user-сообщения
+          в system: False; в <memory> user-сообщения: True
+[FIXED  ] H-2: Инъекция другого пользователя не попадает в промпт вообще
+          
+[FIXED  ] H-5: FTS-амплификация и блокировка event loop
+          get_smart_facts(30k слов) = 7 мс (было ~1080); SQLite в потоке: ['memdb_0'], ONNX — anyio.to_thread
+[FIXED  ] M-5: Без X-OpenWebUI-Chat-Id: chat_id по отпечатку разговора, Context Bridge работает
+          
+[FIXED  ] L: Mood/summaries — мёртвый код удалён
+          
+[FIXED  ] H-1: Пользователи изолированы: факты, векторы, /pull
+          live=[('alice', 'Тверь'), ('bob', 'Омск')]; Тверь у bob в промпте: False; /pull чужого чата: False
+[FIXED  ] M-1: /facts, /forget (факт и вектор удалены, команда не сохранена)
+          /facts показал факт: True; удалён: True; команда в истории: 0
+[FIXED  ] L: PRAISE/CRITIQUE: основы с \b и отрицания
+          {'ошибка в коде': 'CRITIQUE', 'бесполезно': 'CRITIQUE', 'не хорошо': 'CRITIQUE'}
+[FIXED  ] L: Латинские триггеры эмоций отбрасываются
+          
+
+Сводка: {'FIXED': 28, 'PARTIAL': 0, 'OPEN': 0, 'NEW': 0}

@@ -1,0 +1,10 @@
+=== v4.8.0  MODE=global0 ===
+
+[FIXED  ] H-1: GLOBAL_MEMORY=0: факт чата B инвалидирует факт чата A
+          [('userA-chat', 'Москва', None), ('userB-chat', 'Казань', None)]
+[FIXED  ] H-1: GLOBAL_MEMORY=0: эмоции B видны в A
+          'В сообщении пользователя может встретиться блок <memory>…</memory>. Его добавляет система '
+[FIXED  ] H-1: GLOBAL_MEMORY=0: авто-Context Bridge подтягивает переписку B в A
+          
+
+Сводка: {'FIXED': 3, 'PARTIAL': 0, 'OPEN': 0, 'NEW': 0}

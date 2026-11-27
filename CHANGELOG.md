@@ -27,7 +27,11 @@
 - `KEEP_RECENT` и обрезка «первые 100 символов последних восьми сообщений».
 
 ### Тесты
-- 116 → 172 (+32 параметризованных по шаблонам llama.cpp при `TPL_DIR`): `tests/test_context.py`, `tests/test_v5_budget.py`, `tests/test_v5_users.py`, `tests/test_v5_context.py`, `tests/test_v5_templates.py`.
+- 116 → 173 (+32 параметризованных по шаблонам llama.cpp при `TPL_DIR`): `tests/test_context.py`, `tests/test_v5_budget.py`, `tests/test_v5_users.py`, `tests/test_v5_context.py`, `tests/test_v5_templates.py`.
+
+### Документация
+- Новый каталог `docs/`: дизайн v5 и v4.9, аудиты v4.7.2 и v4.7.3 со статусом находок, отчёт о регрессе v5.0.0, скрипты и данные бенчмарков. Ссылки — в README, раздел «Документация: дизайн и аудиты».
+- В таблице конфигурации — `SUMMARY_MAX_CH` и `SUMMARY_INPUT_MAX`.
 
 ### Обновление
 - Схема мигрирует автоматически (новые таблицы `chat_chain`, `chat_epochs`, `pinned_deltas`). Если вы пользовались v4.8 с `ENABLE_FORWARD_USER_INFO_HEADERS` или полем `user`, память лежит у нескольких `user_id` — выполните `manage.py merge --into default` (см. README, «Обновление»). Если прокси используют несколько человек, задайте `USER_MODE=multi`.
