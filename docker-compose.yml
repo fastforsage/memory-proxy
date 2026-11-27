@@ -1,18 +1,25 @@
 services:
   memory-proxy:
-    image: fastforsage/memory-proxy:v4.8.0
+    image: fastforsage/memory-proxy:v5.0.0
     container_name: memory-proxy
     ports:
       - "127.0.0.1:8081:8081"
     environment:
       - LLAMA_URL=${LLAMA_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - DB_PATH=/data/memory.db
-      - COMPRESS_AT=16000
-      - KEEP_RECENT=8
       - API_KEY=${MEMORY_PROXY_API_KEY:-}
-      # Персональные ключи "user:key,user2:key2": ключ определяет пользователя (необязательно)
+      # single — один владелец с любыми клиентами (по умолчанию); multi — несколько пользователей (README)
+      - USER_MODE=${USER_MODE:-single}
+      # Лимит контекста модели в токенах; 0 — узнать у бэкенда (/props) или из ошибки 400
+      - CONTEXT_LIMIT=${CONTEXT_LIMIT:-0}
+      # Верхняя граница окна в токенах, даже если контекст модели больше
+      - COMPRESS_AT=${COMPRESS_AT:-16000}
+      # Отдельная модель для саммари старой части чата (по умолчанию — как EXTRACT_URL)
+      - SUMMARY_URL=${SUMMARY_URL:-}
+      - SUMMARY_MODEL=${SUMMARY_MODEL:-}
+      # Только для USER_MODE=multi: персональные ключи "user:key,user2:key2"
       - API_KEYS=${MEMORY_PROXY_API_KEYS:-}
-      # Доверять X-OpenWebUI-User-Id / полю user (1) или считать всех одним пользователем (0)
+      # Только для USER_MODE=multi: доверять X-OpenWebUI-User-Id / полю user
       - TRUST_USER_HEADER=${TRUST_USER_HEADER:-1}
       # Кому отдать данные, сохранённые до v4.8 (по умолчанию 'default')
       - LEGACY_USER_ID=${LEGACY_USER_ID:-}
