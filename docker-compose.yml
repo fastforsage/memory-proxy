@@ -1,14 +1,28 @@
 services:
   memory-proxy:
-    image: ghcr.io/fastforsage/memory-proxy:latest
-    build: . # Позволяет собрать локально, если не хотите ждать GitHub
+    image: fastforsage/memory-proxy:v4.7.3
     container_name: memory-proxy
-    network_mode: host
+    ports:
+      - "127.0.0.1:8081:8081"
     environment:
-      - LLAMA_URL=http://127.0.0.1:8080/v1/chat/completions
+      - LLAMA_URL=${LLAMA_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - DB_PATH=/data/memory.db
-      - COMPRESS_AT=22000
+      - COMPRESS_AT=16000
       - KEEP_RECENT=8
+      - API_KEY=${MEMORY_PROXY_API_KEY:-}
+      - CORS_ORIGINS=${MEMORY_PROXY_CORS_ORIGINS:-}
+      - GLOBAL_MEMORY=${GLOBAL_MEMORY:-1}
+      - EXTRACT_URL=${EXTRACT_URL:-}
+      - EXTRACT_MODEL=${EXTRACT_MODEL:-}
+      - LOG_LEVEL=INFO
     volumes:
       - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

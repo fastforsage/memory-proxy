@@ -1,0 +1,14 @@
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db.backup.*
+*.db.before_*
+*.db.cleanup_*
+__pycache__/
+*.pyc
+.git/
+.vscode/
+.idea/
+*.md
+tests/
