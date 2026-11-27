@@ -1,5 +1,13 @@
 # Changelog
 
+**Русский** | [English](CHANGELOG.en.md)
+
+## Не выпущено
+
+### Документация
+- Английский перевод всей документации: [`README.en.md`](README.en.md), [`CHANGELOG.en.md`](CHANGELOG.en.md) и [`docs/en/`](docs/en/README.md) (дизайны v5 и v4.9, аудиты v4.7.2 и v4.7.3, отчёт о регрессе v5.0.0, README бенчмарков).
+- Исследование модели эмбеддингов: идеальная ли `granite-embedding-97m-multilingual-r2` мультиязычная замена `USER2-small`. Результаты, вердикт и план интеграции — [`docs/design/embedding-model.md`](docs/design/embedding-model.md) ([EN](docs/en/design/embedding-model.md)); бенчмарк — [`docs/bench/embeddings/`](docs/bench/embeddings/).
+
 ## v5.0.0 — 2026-11-27
 
 Новая работа с контекстом: промпт только дописывается, поэтому KV-кэш модели переиспользуется от хода к ходу, а дорогая работа (саммари, прогрев кэша, извлечение фактов) идёт в фоне и не задерживает ответ. Режим по умолчанию — один пользователь с любыми клиентами.
