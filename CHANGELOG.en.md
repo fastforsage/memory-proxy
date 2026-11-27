@@ -4,9 +4,40 @@
 
 > English translation of [`CHANGELOG.md`](CHANGELOG.md). If the two differ, the Russian original is authoritative.
 
-## Unreleased
+## v5.0.1 — 2026-11-27
+
+Fixes from UX testing: a live run with an Open WebUI-like client, the OpenAI SDK, SillyTavern, an agent with tools, `manage.py` and a stopped/crashing backend (llama.cpp, Qwen2.5-0.5B and 1.5B). v5.0.0 passed 58 of 78 checks, v5.0.1 passes 80 of 80. Report: [`docs/en/audit/v5.0.1-ux.md`](docs/en/audit/v5.0.1-ux.md).
+
+### Memory
+- **Facts are remembered again in Open WebUI.** After every answer Open WebUI sends title, tags and follow-up requests; they preempted background fact extraction, which gave up after four attempts, so facts were never stored. A preempted extraction is now retried for up to `COLD_RETRY_S` (30 min), and slash commands do not touch the background.
+- **Extraction prompt for small models.** A predicate list with descriptions, rules and an example instead of a schema with placeholders: Qwen2.5-1.5B on 10 typical messages finds 15 correct facts instead of 1. Predicate synonyms from the model are mapped to the list (`city` → `lives_in`, `job` → `works_at`…), small differences between the quote and the message are tolerated.
+- New single-valued predicate **`name`**, only for a self-introduction ("my name is…", "I'm…", "call me…"), not "went out with my wife Masha".
+- Rejected: negated facts ("Google didn't hire me"), a value that matches the quote only by a word prefix ("любил" ↔ "любимый"), and, if the model considered the message technical, quotes not in the first person (previously such messages lost personal facts too: "I'm a programmer, I write Python").
+- How many facts were rejected and why is logged (`[Cold] facts rejected: …`).
+- **Style examples:** an answer truncated by `max_tokens` does not become an example; if the model repeats an example verbatim (small models copy it instead of answering, and the copy became an example again), the example is removed.
+
+### Clients
+- **Errors in OpenAI format** (`{"error": {"message", "type", "code"}}`, the `detail` field is kept): wrong key, broken JSON, empty or malformed `messages`, non-JSON `Content-Type` (415), message too long (413 with the limit), foreign `Host` (a hint about `ALLOWED_HOSTS`; the log says which name to add). SDKs and clients show the error text instead of "Unknown error".
+- **Backend unreachable** → 502/504 with the address and a hint about `LLAMA_URL` instead of 500 and a traceback; the same for `/v1/models`. Backend answered with broken JSON → 502 `backend_bad_response`.
+- **Backend broke the stream** → the client gets an SSE `error` event (`backend_stream_error`) and `[DONE]`; the partial answer is not written to history. Previously the stream just stopped and half an answer was saved.
+- **Regenerate** replaces the previous answer in history instead of adding a second one; the previous style example is removed.
+- Open WebUI **emoji**, **MoA** and **tool selection** service requests (system "Available Tools…" + `Query:`) no longer reach memory; custom system-prompt markers go to `SERVICE_SYSTEM_PATTERNS`. Service requests also preempt the background, so a title does not wait minutes behind fact extraction.
+- **A typo in a command** (`/fact`, `/serch cat`) → "❓ Команды /fact нет. Возможно, /facts?" instead of a model answer.
+- `GET /` says what the service is and where to point a client (was 404).
+- `/health`: `backend` (address, `reachable`, error; cached 15 s) and `background` (how many user requests the background is waiting for). An unreachable model does not make `status` false.
+- The background can no longer hang if a client disconnects mid-stream.
+
+### `manage.py`
+- `facts` and `export` without an argument show the owner `OWNER`; an unknown command or bad arguments print a clear message and exit with code 2 instead of a traceback.
+
+### Configuration
+- New: `COLD_RETRY_S` (default `1800`), `SERVICE_SYSTEM_PATTERNS`. `MAX_INPUT_LEN` now answers 413.
+
+### Tests
+- 205 → 249: `tests/test_v501_ux.py`.
 
 ### Documentation
+- v5.0.1 UX test report: [`docs/en/audit/v5.0.1-ux.md`](docs/en/audit/v5.0.1-ux.md) ([RU](docs/audit/v5.0.1-ux.md)).
 - English translation of all documentation: [`README.en.md`](README.en.md), this file and [`docs/en/`](docs/en/README.md) (designs v5 and v4.9, the v4.7.2 and v4.7.3 audits, the v5.0.0 regression report, the benchmark READMEs).
 - Embedding model study: is `granite-embedding-97m-multilingual-r2` the ideal multilingual replacement for `USER2-small`? Results, verdict and integration plan: [`docs/design/embedding-model.md`](docs/design/embedding-model.md) ([EN](docs/en/design/embedding-model.md)); bench: [`docs/bench/embeddings/`](docs/bench/embeddings/).
 

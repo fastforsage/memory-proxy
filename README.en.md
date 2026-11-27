@@ -111,7 +111,7 @@ curl http://127.0.0.1:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"local","messages":[{"role":"user","content":"Hi! I live in Kazan and work at Yandex."}]}'
 ```
-A few seconds later the facts appear in the database. Check with the `/facts` command in a chat or with `docker exec memory-proxy python manage.py facts default` (see [Data](#data-viewing-backup-deletion)).
+A few seconds later the facts appear in the database. Check with the `/facts` command in a chat or with `docker exec memory-proxy python manage.py facts` (see [Data](#data-viewing-backup-deletion)).
 
 ---
 
@@ -119,7 +119,7 @@ A few seconds later the facts appear in the database. Check with the `/facts` co
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/health` | no | Liveness, mode, backend context limits and counters (epochs, summaries, share of tokens served from cache) |
+| `GET` | `/health` | no | Liveness, mode, LLM backend reachability (`backend.reachable`), backend context limits and counters (epochs, summaries, share of tokens served from cache). An unreachable backend does not make `status` false: the proxy is alive and commands work |
 | `GET` | `/v1/models` | yes* | Forwarded to `LLAMA_URL` with `/chat/completions` replaced by `/models` |
 | `POST` | `/v1/chat/completions` | yes* | Main endpoint with memory, supports `stream: true` |
 | any | other `/v1/*` | yes* | `/v1/embeddings`, `/v1/completions` etc. are forwarded to the backend as is, without memory (`PASSTHROUGH=0` disables this) |
@@ -136,7 +136,7 @@ A few seconds later the facts appear in the database. Check with the `/facts` co
 # docker-compose.yml (excerpt)
 services:
   memory-proxy:
-    image: fastforsage/memory-proxy:v5.0.0
+    image: fastforsage/memory-proxy:v5.0.1
     container_name: memory-proxy
     restart: unless-stopped
     # no need to publish ports if the client is on the same network
@@ -212,6 +212,7 @@ Background requests (fact extraction, summaries, warm-up) wait while the model i
 | `TRUST_USER_HEADER` | `TRUST_USER_HEADER` | `1` | `multi` only: `0` ignores `X-OpenWebUI-User-Id` and the `user` field |
 | `CHAT_ID_HEADERS` | — | `X-OpenWebUI-Chat-Id` | Comma-separated chat ID headers, in priority order. Without them the chat is identified by history |
 | `SERVICE_PATTERNS` | — | empty | Extra markers of client service prompts, separated by `\|\|` (such requests are proxied without memory and not stored) |
+| `SERVICE_SYSTEM_PATTERNS` | — | empty | The same for the system prompt of a single-message service request (Open WebUI tool selection is built in) |
 | `CLIENT_STRIP_PATTERNS` | — | empty | Extra regexes separated by `\|\|`: what to strip from a message before saving it to memory |
 | `PASSTHROUGH` | — | `1` | Forward other `/v1/*` to the backend as is |
 | `LEGACY_USER_ID` | `LEGACY_USER_ID` | `default` | Who receives the data stored before the per-user split when migrating to v4.8 |
@@ -227,7 +228,8 @@ Background requests (fact extraction, summaries, warm-up) wait while the model i
 | `SUMMARY_URL` / `SUMMARY_MODEL` | `SUMMARY_URL` / `SUMMARY_MODEL` | = `EXTRACT_URL` / `EXTRACT_MODEL` | Model for summaries |
 | `SUMMARY_MAX_CH` / `SUMMARY_INPUT_MAX` | — | `2000` / `24000` | Summary length and the maximum text per model call (longer input is summarised in parts, then the parts are summarised) |
 | `WARMUP` | — | `1` | Warm up the KV cache of the new prefix before an epoch change |
-| `BACKGROUND_PREEMPT` | — | `1` | Cancel background model requests when a user request arrives |
+| `BACKGROUND_PREEMPT` | — | `1` | Cancel background model requests when a user request or a client service request arrives |
+| `COLD_RETRY_S` | — | `1800` | How many seconds to keep retrying a preempted fact extraction before giving up (a warning is logged) |
 | `RECALL` / `RECALL_K` | — | `1` / `3` | Fragments from the cut-off beginning of the chat added to a question, and their maximum |
 | `EPOCH_PREP_AT` / `EPOCH_AT` / `EPOCH_TARGET` | — | `0.7` / `1.0` / `0.5` | Budget fractions: start preparing an epoch / shift synchronously / window size after the shift |
 | `MODEL_PROFILES` | — | empty | JSON `{"model regex": {"context_limit": 8192, "system_mode": "first_user", "chars_per_token": 3.5}}`: manual overrides if auto-detection is wrong |
@@ -236,7 +238,7 @@ Background requests (fact extraction, summaries, warm-up) wait while the model i
 | `CHARS_PER_TOKEN` | — | `3.0` | Initial characters-per-token estimate (then calibrated from the backend's `usage`) |
 | `CONTEXT_MODE` | — | `v5` | `legacy`: a plain sliding window without epochs or pinned memory |
 | `EXTRACT_MAX_TOKENS` | — | `512` | Maximum response length for fact extraction |
-| `MAX_INPUT_LEN` | — | `200000` | Maximum user message length in characters (otherwise 400) |
+| `MAX_INPUT_LEN` | — | `200000` | Maximum user message length in characters (otherwise 413 with a clear message) |
 | `MAX_PENDING_COLD` | `MAX_PENDING_COLD` | `32` | Maximum number of background extractions waiting at once. Beyond it new messages are stored but not analysed (a warning is logged) |
 | `DB_PATH` | — | `/data/memory.db` | SQLite database path |
 | `MODEL_DIR` | — | `/app/model` | Directory with the ONNX model and tokenizer (already in the image) |
@@ -247,11 +249,11 @@ Background requests (fact extraction, summaries, warm-up) wait while the model i
 ## What gets remembered
 
 ### Facts
-Extracted in the background and only with a supporting quote: the quote (at least 8 characters) must appear verbatim in the message, and the fact's value must appear in the quote (inflection-aware). An invalid item in the model's response is dropped; the rest are kept. Allowed predicates:
+Extracted in the background and only with a supporting quote: the quote (at least 8 characters) must be in the message, and the fact's value must appear in the quote (inflection-aware). Small deviations by the model (case, punctuation, an inserted word) are tolerated: the matching fragment of the message is taken and the value is looked up in it. Rejected: negated facts ("Google didn't hire me"; except `dislikes`), `name` without a self-introduction ("my name is…", "I'm…", "call me…") and, if the model considered the message technical, quotes not in the first person. Predicate synonyms from the model are mapped to the list (`city` → `lives_in`, `job` → `works_at`, `pet` → `has_pet`…). An invalid item in the model's response is dropped; the rest are kept; how many were rejected and why is logged (`[Cold] facts rejected`). Allowed predicates:
 
 | Single-valued (a new value closes the old one) | Multi-valued |
 |---|---|
-| `works_at`, `lives_in`, `age`, `birthday`, `partner_name`, `current_project` | `likes`, `dislikes`, `knows_language`, `uses_tool`, `has_skill`, `has_pet`, `owns`, `interested_in` |
+| `name`, `works_at`, `lives_in`, `age`, `birthday`, `partner_name`, `current_project` | `likes`, `dislikes`, `knows_language`, `uses_tool`, `has_skill`, `has_pet`, `owns`, `interested_in` |
 
 Old values of single-valued facts are not deleted; they get `valid_to`. If the question contains the Russian words «раньше», «прежде», «в прошлом», «помнишь» or «история» ("before", "previously", "in the past", "remember", "history"), a history block is added to the prompt.
 
@@ -353,7 +355,7 @@ Commands are handled by the proxy itself, are not sent to the LLM and are **not 
 | `/search <query>` | Full-text search in your messages in **other** chats |
 | `/help` | Help |
 
-The command must be the whole message. `/pull`, `/search` and `/forget` without an argument return a hint. Messages like `/help me write a script` or `/chats are great` are not commands and go to the model. The reply comes in the format the client asked for (`stream: true` → SSE, otherwise plain JSON).
+The command must be the whole message. `/pull`, `/search` and `/forget` without an argument return a hint. Messages like `/help me write a script` or `/chats are great` are not commands and go to the model. A typo in a command name (`/fact`, `/serch cat`) gets a hint "Did you mean /facts?" instead of a model answer; other words after `/` (`/etc/hosts`, `/imagine`) go to the model. The reply comes in the format the client asked for (`stream: true` → SSE, otherwise plain JSON).
 
 > `/forget` deletes data from the proxy's database, not from the chat history in the client itself (Open WebUI keeps its own).
 
@@ -405,8 +407,8 @@ All memory is one file, `data/memory.db` (SQLite in WAL mode, with `-wal` and `-
 For the user in a chat: `/facts`. For the administrator: the `manage.py` utility, included in the image and usable without stopping the proxy:
 ```bash
 docker exec memory-proxy python manage.py stats                 # users, chats, size
-docker exec memory-proxy python manage.py facts <user>          # a user's current facts
-docker exec memory-proxy python manage.py export <user> > me.json   # everything about a user as JSON
+docker exec memory-proxy python manage.py facts [user]          # current facts (default: the owner, OWNER)
+docker exec memory-proxy python manage.py export [user] > me.json   # everything about a user as JSON (default: OWNER)
 docker exec memory-proxy python manage.py merge --into default  # merge all users' data into the owner
 ```
 `merge` first makes a backup next to the database (`memory.db.bak-…`). For single-valued facts ("lives in …") the newest stays current and the others go to history; emotions are summed. Restart the proxy after `merge` so vectors of the moved facts are recomputed.

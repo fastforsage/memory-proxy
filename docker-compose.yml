@@ -1,6 +1,6 @@
 services:
   memory-proxy:
-    image: fastforsage/memory-proxy:v5.0.0
+    image: fastforsage/memory-proxy:v5.0.1
     container_name: memory-proxy
     ports:
       - "127.0.0.1:8081:8081"

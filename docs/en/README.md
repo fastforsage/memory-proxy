@@ -13,6 +13,7 @@ These are translations of the Russian documents in [`docs/`](../README.md). If a
 - [Embedding model study: USER2-small vs granite-embedding-97m-multilingual-r2](design/embedding-model.md): is granite the ideal multilingual replacement for the default model? Bench on a domain memory set (14 predicates, 7 languages) and public MTEB sets, latency, memory, integration cost.
 
 ## Audits and checks
+- [UX tests v5.0.0 → v5.0.1](audit/v5.0.1-ux.md): a live run with clients (Open WebUI, OpenAI SDK, SillyTavern, an agent), backend failures and `manage.py`; findings B1–B9 and R1–R7 and their fixes.
 - [v5.0.0 regression](audit/v5.0.0-regression.md): tests per stage, 32 llama.cpp templates, a live run, defects found and fixed before the release.
 - [v4.7.2 audit](audit/v4.7.2-audit.md): security, privacy, memory correctness, performance, Docker/CI, dependencies; a table of where each finding was closed.
 - [v4.7.3 re-audit](audit/v4.7.3-recheck.md): checking the fixes, new findings (CSRF, DNS rebinding, command and classifier regressions), the patch that became v4.7.4.
