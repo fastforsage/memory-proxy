@@ -3,6 +3,7 @@ data/
 *.db-wal
 *.db-shm
 *.db.backup.*
+*.db.bak-*
 *.db.before_*
 *.db.cleanup_*
 __pycache__/
