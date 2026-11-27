@@ -122,24 +122,40 @@ class Ctx:
     def __init__(self, client, proxy, llm):
         self.client, self.proxy, self.llm = client, proxy, llm
 
-    def chat(self, text, chat_id="chat-a", stream=False, history=None, headers=None, model="test-model"):
+    def chat(self, text, chat_id="chat-a", stream=False, history=None, headers=None, model="test-model", user=None, body_extra=None):
         h = {"X-OpenWebUI-Chat-Id": chat_id} if chat_id else {}
+        if user:
+            h["X-OpenWebUI-User-Id"] = user
         if self.proxy.API_KEY:
             h["Authorization"] = f"Bearer {self.proxy.API_KEY}"
         h.update(headers or {})
         msgs = list(history or []) + [{"role": "user", "content": text}]
-        return self.client.post("/v1/chat/completions", json={"model": model, "stream": stream, "messages": msgs}, headers=h)
+        body = {"model": model, "stream": stream, "messages": msgs, **(body_extra or {})}
+        return self.client.post("/v1/chat/completions", json=body, headers=h)
 
     def drain(self, timeout=5.0):
         end = time.time() + timeout
         while time.time() < end:
             if not self.proxy.app.state.tasks:
+                self.proxy._DB.submit(lambda: None).result(timeout=timeout)   # дождаться записей в потоке БД
                 return
             time.sleep(0.02)
         raise AssertionError("cold tasks did not finish")
 
     def db(self, sql, *params):
-        return self.proxy._conn.execute(sql, params).fetchall()
+        self.proxy._DB.submit(lambda: None).result(timeout=5)
+        return self.proxy._DB.submit(lambda: self.proxy._conn.execute(sql, params).fetchall()).result(timeout=5)
+
+    def system_text(self, idx=-1):
+        return " ".join(m["content"] for m in self.llm.chat_requests[idx]["messages"] if m["role"] == "system")
+
+    def last_user_text(self, idx=-1):
+        return [m for m in self.llm.chat_requests[idx]["messages"] if m["role"] == "user"][-1]["content"]
+
+    def memory_text(self, idx=-1):
+        """Содержимое блока <memory> в последнем user-сообщении, отправленном в LLM ('' если блока нет)."""
+        t = self.last_user_text(idx)
+        return t.split("<memory>", 1)[1].split("</memory>", 1)[0] if t.startswith("<memory>") else ""
 
 
 @pytest.fixture

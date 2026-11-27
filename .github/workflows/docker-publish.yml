@@ -25,7 +25,9 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - name: Install dependencies (the same pins as the image)
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest pyflakes
+      - name: Lint (pyflakes)
+        run: pyflakes proxy.py manage.py download_model.py tests/
       - name: Unit + HTTP integration tests (ONNX stubbed)
         run: pytest -q tests/
 
@@ -72,6 +74,13 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/v1/models)" = 401
           test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-secret' \
                  -H 'Content-Type: text/plain' -d '{}' http://localhost:8081/v1/chat/completions)" = 415
+          # Команды памяти отвечают без LLM
+          curl -fsS -H 'Authorization: Bearer ci-secret' -H 'Content-Type: application/json' \
+               -H 'X-OpenWebUI-User-Id: ci-user' \
+               -d '{"messages":[{"role":"user","content":"/facts"}]}' \
+               http://localhost:8081/v1/chat/completions | grep -q 'ci-user'
+          # manage.py есть в образе и видит базу
+          docker exec mp python manage.py stats
           docker logs mp
 
       - uses: docker/login-action@v4

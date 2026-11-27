@@ -97,7 +97,7 @@ def test_commands_work(ctx):
     assert ctx.llm.chat_requests[-1]["messages"][-1]["content"] == "Мой любимый фреймворк FastAPI"   # команды не ушли в LLM
 
 
-def test_commands_hidden_from_chats_and_pull(ctx):
+def test_commands_are_not_stored(ctx):
     ctx.chat("Обычное сообщение про отпуск", chat_id="chat-one")
     ctx.chat("/help", chat_id="chat-one")
     ctx.chat("/chats", chat_id="cmd-only")
@@ -105,6 +105,7 @@ def test_commands_hidden_from_chats_and_pull(ctx):
     assert "chat-one" in listing and "cmd-only" not in listing
     pulled = ctx.chat("/pull chat-one", chat_id="cmd-only").json()["choices"][0]["message"]["content"]
     assert "отпуск" in pulled and "/help" not in pulled and "Команды memory-proxy" not in pulled
+    assert ctx.db("SELECT COUNT(*) FROM messages WHERE content LIKE '/%' OR content LIKE '%Команды memory-proxy%'")[0][0] == 0
 
 
 def test_command_usage_without_argument(ctx):
@@ -133,7 +134,7 @@ def test_slash_text_goes_to_llm(ctx, text):
 
 
 # ─── Память ───
-def test_memory_in_first_system_message(ctx):
+def test_memory_goes_to_user_message_policy_to_system(ctx):
     ctx.llm.cold(facts=[{"predicate": "lives_in", "object": "Казань", "evidence": "я живу в казани"}])
     ctx.chat("Я живу в Казани")
     ctx.drain()
@@ -142,7 +143,11 @@ def test_memory_in_first_system_message(ctx):
     ctx.chat("Где я живу? Напомни, пожалуйста", history=history)
     msgs = ctx.llm.chat_requests[-1]["messages"]
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
-    assert msgs[0]["content"].startswith("You are helpful") and "lives_in: Казань" in msgs[0]["content"]
+    assert msgs[0]["content"].startswith("You are helpful") and ctx.proxy.MEMORY_POLICY in msgs[0]["content"]
+    assert "Казань" not in msgs[0]["content"]                       # в system — только статичная политика
+    assert "lives_in: Казань" in ctx.memory_text()
+    assert ctx.last_user_text().endswith("</memory>\n\nГде я живу? Напомни, пожалуйста")
+    assert msgs[1]["content"] == "привет"                            # история не трогается
 
 
 def test_technical_message_skips_memory(ctx):
@@ -156,11 +161,11 @@ def test_service_request_passthrough(ctx):
     ctx.chat("Расскажи коротко про Python")
     ctx.drain()
     before_msgs = ctx.db("SELECT COUNT(*) FROM messages")[0][0]
-    ex_before = ctx.proxy.LAST_EXAMPLE_ID.get("chat-a")
+    ex_before = ctx.proxy.LAST_EXAMPLE_ID.get(("default", "chat-a"))
     ctx.chat("### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history")
     ctx.drain()
     assert ctx.db("SELECT COUNT(*) FROM messages")[0][0] == before_msgs
-    assert ctx.proxy.LAST_EXAMPLE_ID.get("chat-a") == ex_before
+    assert ctx.proxy.LAST_EXAMPLE_ID.get(("default", "chat-a")) == ex_before
     assert "system" not in [m["role"] for m in ctx.llm.chat_requests[-1]["messages"]]
 
 
@@ -296,8 +301,6 @@ def test_global_memory_0_scopes_fact_search(make_ctx):
     c.chat("Я люблю джаз", chat_id="chat-a")
     c.drain()
     c.chat("Какую музыку я люблю? джаз или рок", chat_id="chat-b")
-    sys_b = " ".join(m["content"] for m in c.llm.chat_requests[-1]["messages"] if m["role"] == "system")
-    assert "likes: джаз" not in sys_b
+    assert "likes: джаз" not in c.memory_text()
     c.chat("Какую музыку я люблю? джаз или рок", chat_id="chat-a")
-    sys_a = " ".join(m["content"] for m in c.llm.chat_requests[-1]["messages"] if m["role"] == "system")
-    assert "likes: джаз" in sys_a
+    assert "likes: джаз" in c.memory_text()
