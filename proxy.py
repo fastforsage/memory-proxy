@@ -1,4 +1,4 @@
-import os, re, time, math, hmac, hashlib, sqlite3, asyncio, logging, threading
+import os, re, json, time, math, hmac, random, hashlib, sqlite3, asyncio, logging, threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import anyio
@@ -12,8 +12,9 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+import context as cx
 
-VERSION = "4.8.0"
+VERSION = "5.0.0"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -36,9 +37,9 @@ def _parse_api_keys(spec: str) -> dict:
 LLAMA_URL = os.getenv("LLAMA_URL", "http://127.0.0.1:8080/v1/chat/completions")
 EXTRACT_URL = os.getenv("EXTRACT_URL", "") or LLAMA_URL
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "")
+EXTRACT_MAX_TOKENS = max(64, int(os.getenv("EXTRACT_MAX_TOKENS", "512")))
 DB_PATH = os.getenv("DB_PATH", "/data/memory.db")
 COMPRESS_AT = int(os.getenv("COMPRESS_AT", "16000"))
-KEEP_RECENT = max(1, int(os.getenv("KEEP_RECENT", "8")))
 MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "200000"))
 MAX_PENDING_COLD = max(1, int(os.getenv("MAX_PENDING_COLD", "32")))
 MODEL_DIR = os.getenv("MODEL_DIR", "/app/model")
@@ -51,6 +52,54 @@ GLOBAL_MEMORY = os.getenv("GLOBAL_MEMORY", "1") == "1"
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 ALLOWED_HOSTS = [h.strip() for h in os.getenv(
     "ALLOWED_HOSTS", "localhost,127.0.0.1,host.docker.internal,memory-proxy").split(",") if h.strip()]
+
+def _env_float(name: str, default: float) -> float:
+    try: return float(os.getenv(name, "") or default)
+    except ValueError: raise RuntimeError(f"FATAL: {name} must be a number")
+
+def _env_list(name: str, sep: str = "||") -> list:
+    return [x.strip() for x in os.getenv(name, "").split(sep) if x.strip()]
+
+# ─── v5: пользователи и клиенты ───
+USER_MODE = os.getenv("USER_MODE", "single").strip().lower()
+if USER_MODE not in ("single", "multi"):
+    raise RuntimeError("FATAL: USER_MODE must be 'single' or 'multi'")
+OWNER = (os.getenv("OWNER", "") or "default").strip()[:128]
+CHAT_ID_HEADERS = [h.strip() for h in os.getenv("CHAT_ID_HEADERS", "X-OpenWebUI-Chat-Id").split(",") if h.strip()]
+PASSTHROUGH = os.getenv("PASSTHROUGH", "1") == "1"
+
+# ─── v5: контекст ───
+CONTEXT_MODE = os.getenv("CONTEXT_MODE", "v5").strip().lower()
+if CONTEXT_MODE not in ("v5", "legacy"):
+    raise RuntimeError("FATAL: CONTEXT_MODE must be 'v5' or 'legacy'")
+CONTEXT_LIMIT = int(os.getenv("CONTEXT_LIMIT", "0") or 0)       # 0 — узнать у бэкенда
+ANSWER_RESERVE = int(os.getenv("ANSWER_RESERVE", "1024"))
+OVERSIZE = os.getenv("OVERSIZE", "truncate").strip().lower()
+if OVERSIZE not in ("truncate", "reject"):
+    raise RuntimeError("FATAL: OVERSIZE must be 'truncate' or 'reject'")
+CHARS_PER_TOKEN = _env_float("CHARS_PER_TOKEN", 3.0)
+EPOCH_PREP_AT = _env_float("EPOCH_PREP_AT", 0.7)
+EPOCH_AT = _env_float("EPOCH_AT", 1.0)
+EPOCH_TARGET = _env_float("EPOCH_TARGET", 0.5)
+ELIDE_KEEP_TURNS = max(1, int(os.getenv("ELIDE_KEEP_TURNS", "2")))
+PROFILE_CH = int(os.getenv("PROFILE_CH", "1500"))
+DELTA_CH = int(os.getenv("DELTA_CH", "600"))
+SUMMARY = os.getenv("SUMMARY", "1") == "1"
+SUMMARY_URL = os.getenv("SUMMARY_URL", "") or EXTRACT_URL
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "") or EXTRACT_MODEL
+SUMMARY_MAX_CH = int(os.getenv("SUMMARY_MAX_CH", "2000"))
+SUMMARY_INPUT_MAX = int(os.getenv("SUMMARY_INPUT_MAX", "24000"))
+WARMUP = os.getenv("WARMUP", "1") == "1"
+BACKGROUND_PREEMPT = os.getenv("BACKGROUND_PREEMPT", "1") == "1"
+RECALL = os.getenv("RECALL", "1") == "1"
+RECALL_K = max(0, int(os.getenv("RECALL_K", "3")))
+try:
+    MODEL_PROFILES = json.loads(os.getenv("MODEL_PROFILES", "") or "{}")
+    if not isinstance(MODEL_PROFILES, dict): raise ValueError
+    MODEL_PROFILES = {re.compile(k, re.I): v for k, v in MODEL_PROFILES.items() if isinstance(v, dict)}
+except (ValueError, re.error):
+    raise RuntimeError("FATAL: MODEL_PROFILES must be a JSON object {\"regex\": {...}}")
+BACKEND_BASE = re.sub(r"/v1/chat/completions/?$", "", LLAMA_URL).rstrip("/")
 
 DEFAULT_USER = "default"
 # Версия схемы БД (PRAGMA user_version):
@@ -66,7 +115,16 @@ MULTI_VALUED = {"likes", "dislikes", "knows_language", "uses_tool", "has_skill",
 ALLOWED_PREDICATES = SINGLE_VALUED | MULTI_VALUED
 
 SERVICE_PATTERNS = ("### Task:", "Predict 3-5 useful messages", "Generate 1-3 broad tags",
-                    "Generate a concise", "Generate a title", "Suggest 3-5")
+                    "Generate a concise", "Generate a title", "Suggest 3-5",
+                    # LibreChat, SillyTavern и др.: заголовки и подсказки
+                    "5-word-or-less title", "title for the conversation", "Create a short title",
+                    "[Pause your roleplay", "summarize the conversation so far in") + tuple(_env_list("SERVICE_PATTERNS"))
+# Короткий служебный запрос без истории: «сделай заголовок/теги» на английском с малым max_tokens
+SERVICE_HINT = re.compile(r"\b(title|tags?|follow-?up|summar(y|ize))\b", re.I)
+# Обёртки агентных клиентов (Cline, Roo, Aider…): вырезаются перед анализом и поиском памяти
+CLIENT_STRIP = [re.compile(p, re.S | re.I) for p in (
+    r"<environment_details>.*?</environment_details>", r"<file_content[^>]*>.*?</file_content>",
+    r"</?(task|feedback|user_message|answer)>") ] + [re.compile(p, re.S) for p in _env_list("CLIENT_STRIP_PATTERNS")]
 # Явные отсылки к прошлым разговорам. Общие слова вроде «раньше», «помни», «как мы» больше не триггерят.
 CROSS_CHAT_TRIGGERS = re.compile(
     r"\b(помнишь|обсуждали|в другом (?:чате|диалоге)|в прошл(?:ом|ый) (?:разговоре|чате|диалоге|раз)|"
@@ -90,19 +148,20 @@ def safe_float(val, default=0.0, min_val=-1.0, max_val=1.0):
     try: return max(min_val, min(max_val, float(val)))
     except (ValueError, TypeError): return default
 
-def rough_tokens(text) -> int:
-    if not isinstance(text, str): return 1
-    return max(1, len(text) // 3) if text else 0
+def is_service_request(text: str, body: dict = None, n_messages: int = 0) -> bool:
+    if any(p in text for p in SERVICE_PATTERNS): return True
+    # эвристика: один вопрос без истории, малый лимит ответа, английская просьба о заголовке/тегах
+    if body is not None and n_messages <= 1:
+        mt = body.get("max_tokens") or body.get("max_completion_tokens")
+        if isinstance(mt, int) and mt <= 128 and SERVICE_HINT.search(text) and not re.search(r"[а-яё]", text, re.I):
+            return True
+    return False
 
-def total_tokens(msgs) -> int:
-    total = 0
-    for m in msgs:
-        c = m.get("content")
-        total += rough_tokens(c) if isinstance(c, str) else 10
-    return total
-
-def is_service_request(text: str) -> bool:
-    return any(p in text for p in SERVICE_PATTERNS)
+def clean_client_text(text: str) -> str:
+    """Текст пользователя без обёрток агентных клиентов (окружение, файлы, служебные теги)."""
+    for rx in CLIENT_STRIP:
+        text = rx.sub(" ", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 def neutralize(text: str) -> str:
     """Данные из памяти не должны закрыть блок <memory> раньше времени."""
@@ -110,6 +169,7 @@ def neutralize(text: str) -> str:
 
 def _fmt_day(ts) -> str:
     return time.strftime('%Y-%m-%d', time.localtime(ts)) if ts else "?"
+
 
 # ─── Классификатор «код / не код» ───
 # Строка похожа на код: ключевые слова в начале строки, вызов функции на всю строку,
@@ -237,6 +297,15 @@ CREATE TABLE IF NOT EXISTS emotions(user_id TEXT NOT NULL DEFAULT 'default', sco
     last_quote TEXT, PRIMARY KEY(user_id, scope, trigger));
 CREATE TABLE IF NOT EXISTS style_examples(id INTEGER PRIMARY KEY, user_id TEXT NOT NULL DEFAULT 'default',
     text TEXT NOT NULL, context TEXT NOT NULL, score REAL DEFAULT 0, ts REAL);
+CREATE TABLE IF NOT EXISTS chat_chain(user_id TEXT NOT NULL, chat_id TEXT NOT NULL, pos INTEGER NOT NULL,
+    msg_hash TEXT NOT NULL, ts REAL, PRIMARY KEY(user_id, chat_id, pos));
+CREATE TABLE IF NOT EXISTS chat_epochs(user_id TEXT NOT NULL, chat_id TEXT NOT NULL, epoch_id INTEGER NOT NULL,
+    cut_pos INTEGER NOT NULL DEFAULT 0, cut_hash TEXT, elide_pos INTEGER NOT NULL DEFAULT 0, summary TEXT DEFAULT '',
+    profile TEXT DEFAULT '', profile_facts TEXT DEFAULT '[]', memory INTEGER NOT NULL DEFAULT 1,
+    date_string TEXT DEFAULT '', state TEXT NOT NULL DEFAULT 'active', created REAL,
+    PRIMARY KEY(user_id, chat_id, epoch_id));
+CREATE TABLE IF NOT EXISTS pinned_deltas(user_id TEXT NOT NULL, chat_id TEXT NOT NULL, msg_hash TEXT NOT NULL,
+    delta TEXT NOT NULL DEFAULT '', fact_ids TEXT DEFAULT '[]', created REAL, PRIMARY KEY(user_id, chat_id, msg_hash));
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(user_id text partition key, embedding float[384]);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(predicate, object, content='facts', content_rowid='id');
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, chat_id UNINDEXED, role UNINDEXED, content='messages', content_rowid='id');
@@ -262,6 +331,7 @@ CREATE INDEX IF NOT EXISTS ix_msg_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS ix_facts_user ON facts(user_id, valid_to);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_facts_live ON facts(user_id, scope, predicate, object) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS ix_style_user ON style_examples(user_id, context, score DESC);
+CREATE INDEX IF NOT EXISTS ix_chain_head ON chat_chain(user_id, msg_hash) WHERE pos = 0;
 """
 
 def _columns(table: str) -> set:
@@ -426,6 +496,7 @@ async def lifespan(app: FastAPI):
     await db(startup_db)
     llm_semaphore = asyncio.Semaphore(1)
     app.state.tasks = set()
+    app.state.bg = set()
     bg = [asyncio.create_task(retention_loop())] if RETENTION_DAYS > 0 else []
 
     app.state.http = httpx.AsyncClient(
@@ -434,12 +505,20 @@ async def lifespan(app: FastAPI):
     )
     if not API_KEY and not USER_KEYS:
         log.warning("API_KEY is not set: any local process can read and write the memory. Setting API_KEY is recommended.")
-    if USER_KEYS:
+    if USER_KEYS and USER_MODE == "multi":
         log.info(f"Per-user API keys: {len(USER_KEYS)} user(s)")
-    log.info(f"Ready. memory-proxy v{VERSION} (GLOBAL_MEMORY={int(GLOBAL_MEMORY)}, "
-             f"RETENTION_DAYS={RETENTION_DAYS:g}, TRUST_USER_HEADER={int(TRUST_USER_HEADER)})")
+    if USER_MODE == "single":
+        others = await db(other_users_with_data)
+        if others:
+            log.warning(f"USER_MODE=single: memory is read only for '{OWNER}', but the DB also has data of {others[:10]}. "
+                        f"Merge it: python manage.py merge --into {OWNER}")
+        if USER_KEYS:
+            log.info(f"USER_MODE=single: {len(USER_KEYS)} API key(s) from API_KEYS, all of them belong to '{OWNER}'")
+    log.info(f"Ready. memory-proxy v{VERSION} (USER_MODE={USER_MODE}, CONTEXT_MODE={CONTEXT_MODE}, "
+             f"GLOBAL_MEMORY={int(GLOBAL_MEMORY)}, RETENTION_DAYS={RETENTION_DAYS:g}, "
+             f"CONTEXT_LIMIT={CONTEXT_LIMIT or 'auto'}, SUMMARY={int(SUMMARY)}, WARMUP={int(WARMUP)})")
     yield
-    for t in list(app.state.tasks) + bg: t.cancel()
+    for t in list(app.state.tasks) + list(app.state.bg) + bg: t.cancel()
     await app.state.http.aclose()
     _DB.shutdown(wait=True)
     if _conn: _conn.close()
@@ -478,22 +557,14 @@ def _clean_id(v, n: int = 128) -> str:
     return v.strip()[:n] if isinstance(v, str) and v.strip() else ""
 
 def resolve_user(request: Request, body: dict, key_user) -> str:
-    """Персональный ключ > X-OpenWebUI-User-Id > поле `user` (OpenAI) > 'default'."""
+    """USER_MODE=single (по умолчанию): все запросы — владельцу OWNER, заголовки и поле `user` не учитываются.
+    USER_MODE=multi: персональный ключ > X-OpenWebUI-User-Id > поле `user` (OpenAI) > 'default'."""
+    if USER_MODE == "single": return OWNER
     if key_user: return key_user
     if TRUST_USER_HEADER:
         u = _clean_id(request.headers.get("X-OpenWebUI-User-Id")) or _clean_id(body.get("user"))
         if u: return u
     return DEFAULT_USER
-
-def extract_chat_id(request: Request, user_id: str, messages: list) -> str:
-    """X-OpenWebUI-Chat-Id, иначе отпечаток разговора: клиенты присылают всю историю,
-    и первое сообщение пользователя в ней не меняется от хода к ходу."""
-    h = _clean_id(request.headers.get("X-OpenWebUI-Chat-Id"), 200)
-    if h: return h
-    first = next((m.get("content") for m in messages if m.get("role") == "user"), None)
-    if first is None or first == "": return "default"
-    first_s = first if isinstance(first, str) else orjson.dumps(first).decode("utf-8", "ignore")
-    return "auto-" + hashlib.sha1(f"{user_id}\x00{first_s}".encode("utf-8")).hexdigest()[:12]
 
 def scope_of(chat_id: str) -> str:
     """Область памяти: '' — общая для всех чатов пользователя, иначе — конкретный чат."""
@@ -626,18 +697,6 @@ def build_memory(user_id: str, chat_id: str, user_text: str, qv, pre_type: str) 
     if sb: parts.append(sb)
     return "\n\n".join(parts)
 
-def inject_memory(messages: list, last_idx: int, block: str) -> list:
-    """Политика памяти → в system (только статичный текст), сами данные → в последнее сообщение пользователя."""
-    msgs = list(messages)
-    if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
-        msgs[0] = {**msgs[0], "content": msgs[0]["content"] + "\n\n" + MEMORY_POLICY}
-    else:
-        msgs.insert(0, {"role": "system", "content": MEMORY_POLICY})
-        last_idx += 1
-    lu = msgs[last_idx]
-    msgs[last_idx] = {**lu, "content": f"<memory>\n{block}\n</memory>\n\n{lu['content']}"}
-    return msgs
-
 # ─── Команды ───
 HELP_TEXT = ("Команды memory-proxy:\n"
              "/facts — что я о тебе помню (с номерами)\n"
@@ -707,6 +766,12 @@ def _delete_facts(ids: list) -> int:
     _conn.execute(f"DELETE FROM vec_facts WHERE rowid IN ({ph})", ids)
     return _conn.execute(f"DELETE FROM facts WHERE id IN ({ph})", ids).rowcount
 
+def invalidate_pinned_memory(user_id: str):
+    """Забытое не должно всплывать из закреплённых дельт и профилей: они пересобираются на следующем ходе
+    (разовый пересчёт префикса — плата за приватность)."""
+    _conn.execute("DELETE FROM pinned_deltas WHERE user_id=?", (user_id,))
+    _conn.execute("UPDATE chat_epochs SET profile=NULL WHERE user_id=?", (user_id,))
+
 def forget(user_id: str, chat_id: str, arg: str) -> str:
     a = arg.strip()
     al = a.lower()
@@ -717,6 +782,8 @@ def forget(user_id: str, chat_id: str, arg: str) -> str:
             nm = _conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,)).rowcount
             ne = _conn.execute("DELETE FROM emotions WHERE user_id=?", (user_id,)).rowcount
             ns = _conn.execute("DELETE FROM style_examples WHERE user_id=?", (user_id,)).rowcount
+            for t in ("chat_chain", "chat_epochs", "pinned_deltas"):
+                _conn.execute(f"DELETE FROM {t} WHERE user_id=?", (user_id,))
             for k in [k for k in LAST_EXAMPLE_ID if k[0] == user_id]: LAST_EXAMPLE_ID.pop(k, None)
             return f"🗑 Забыл всё: фактов {nf}, сообщений {nm}, эмоций {ne}, примеров стиля {ns}."
         if al == "chat":
@@ -724,6 +791,8 @@ def forget(user_id: str, chat_id: str, arg: str) -> str:
             nf = _delete_facts(fids)
             nm = _conn.execute("DELETE FROM messages WHERE user_id=? AND chat_id=?", (user_id, chat_id)).rowcount
             ne = _conn.execute("DELETE FROM emotions WHERE user_id=? AND scope=?", (user_id, chat_id)).rowcount if chat_id else 0
+            for t in ("chat_chain", "chat_epochs", "pinned_deltas"):
+                _conn.execute(f"DELETE FROM {t} WHERE user_id=? AND chat_id=?", (user_id, chat_id))
             LAST_EXAMPLE_ID.pop((user_id, chat_id), None)
             return f"🗑 Забыл этот чат: сообщений {nm}, фактов {nf}" + (f", эмоций {ne}" if ne else "") + "."
         m = re.fullmatch(r"#?(\d+)", a)
@@ -732,6 +801,7 @@ def forget(user_id: str, chat_id: str, arg: str) -> str:
                                 (int(m.group(1)), user_id)).fetchone()
             if not row: return f"❌ Факт #{m.group(1)} не найден. /facts"
             _delete_facts([row[0]])
+            invalidate_pinned_memory(user_id)
             return f"🗑 Забыл: {row[1]}: {row[2]}"
         if len(a) < 2:
             return "❌ Использование: /forget <N> | /forget <текст> | /forget chat | /forget all"
@@ -744,6 +814,8 @@ def forget(user_id: str, chat_id: str, arg: str) -> str:
         emo_hit = [(s, t) for s, t in emo if _all_stems_in(a, t.lower())]
         for s, t in emo_hit:
             _conn.execute("DELETE FROM emotions WHERE user_id=? AND scope=? AND trigger=?", (user_id, s, t))
+        if hit or emo_hit:
+            invalidate_pinned_memory(user_id)
         if not hit and not emo_hit:
             return f"🤷 Ничего похожего на «{a}» в памяти нет. /facts"
         out = [f"🗑 Забыл ({len(hit) + len(emo_hit)}):"]
@@ -794,19 +866,6 @@ def score_previous(user_id: str, chat_id: str, user_text: str):
     with _conn:
         _conn.execute("UPDATE style_examples SET score = score + ? WHERE id=? AND user_id=?", (delta, ex_id, user_id))
         _conn.execute("DELETE FROM style_examples WHERE id=? AND score <= -2", (ex_id,))
-
-def compress(messages):
-    system = [m for m in messages if m.get("role") == "system"]
-    non_sys = [m for m in messages if m.get("role") != "system"]
-    if len(non_sys) <= KEEP_RECENT + 2: return messages
-    cut = len(non_sys) - KEEP_RECENT
-    # Окно не должно начинаться с ответа инструмента: сдвигаем границу к assistant с tool_calls
-    while cut > 0 and non_sys[cut].get("role") == "tool":
-        cut -= 1
-    old, recent = non_sys[:cut], non_sys[cut:]
-    if not old: return messages
-    frag = " | ".join(f"{m.get('role')}: {str(m.get('content',''))[:100]}" for m in old[-8:] if isinstance(m.get("content"), str))
-    return system + [{"role": "system", "content": f"[РАНЕЕ]: {frag}"}] + recent
 
 # ─── Запись памяти ───
 def invalidate_and_clean_vec(user_id: str, scope: str, pred: str, obj: str, now: float):
@@ -899,7 +958,8 @@ evidence и quote — дословные фрагменты текста. type=t
 Текст: "{text[:4000]}"
 """
     payload = {"messages": [{"role": "user", "content": prompt}],
-               "temperature": 0.1, "response_format": {"type": "json_object"}}
+               "temperature": 0.1, "response_format": {"type": "json_object"},
+               "max_tokens": EXTRACT_MAX_TOKENS}     # малые модели в JSON-режиме зацикливаются на пробелах
     model = EXTRACT_MODEL or original_model
     if model: payload["model"] = model
     return payload
@@ -908,7 +968,11 @@ async def cold_analyze(text: str, user_id: str, chat_id: str, msg_id: int, pre_t
                        http: httpx.AsyncClient, original_model: str = ""):
     async with llm_semaphore:
         try:
-            r = await http.post(EXTRACT_URL, json=build_extract_payload(text, original_model))
+            # фоновая задача: не занимает слот модели, пока пользователь ждёт ответа (BackgroundGate)
+            payload = build_extract_payload(text, original_model)
+            r = await GATE.run(lambda: http.post(EXTRACT_URL, json=payload, timeout=300.0))
+            if r is None:
+                log.warning("[Cold] skipped: model stayed busy with user requests"); return
             if r.status_code != 200:
                 log.warning(f"[Cold] LLM status={r.status_code}: {r.text[:200]}")
                 return
@@ -953,30 +1017,659 @@ def save_assistant_message(user_id: str, chat_id: str, text: str, pre_type: str)
                       (user_id, chat_id, "assistant", text, time.time(), "assistant"))
     save_style_example(user_id, chat_id, text, pre_type)
 
+# ─── v5: пользователи и чаты ───
+def header_chat_id(request: Request) -> str:
+    for h in CHAT_ID_HEADERS:
+        v = _clean_id(request.headers.get(h), 200)
+        if v: return v
+    return ""
+
+def legacy_chat_id(user_id: str, messages: list) -> str:
+    """Отпечаток v4.8 (первое сообщение пользователя) — чтобы старые разговоры продолжились в том же чате."""
+    first = next((m.get("content") for m in messages if m.get("role") == "user"), None)
+    if first is None or first == "": return "default"
+    first_s = first if isinstance(first, str) else orjson.dumps(first).decode("utf-8", "ignore")
+    return "auto-" + hashlib.sha1(f"{user_id}\x00{first_s}".encode("utf-8")).hexdigest()[:12]
+
+def _chain(user_id: str, chat_id: str, limit: int = -1) -> list:
+    return [r[0] for r in _conn.execute("SELECT msg_hash FROM chat_chain WHERE user_id=? AND chat_id=? ORDER BY pos LIMIT ?",
+                                        (user_id, chat_id, limit))]
+
+def resolve_chat(user_id: str, header_id: str, hashes: list, legacy_id: str):
+    """Привязка запроса к чату по префиксу истории. Возвращает (chat_id, последнее сообщение новое?).
+
+    Чат с заголовком — по заголовку. Без заголовка: чат, чья сохранённая цепочка хешей целиком является
+    префиксом присланной истории (продолжение, самая длинная); иначе чат с самым длинным общим префиксом
+    ≥ 2 (ветка после правки/перегенерации); иначе новый чат. Хранятся только хеши того, что прислал
+    клиент: если клиент меняет текст ответа (вырезает размышления), привязка не теряется.
+    """
+    n, now = len(hashes), time.time()
+    if not n: return header_id or "default", True
+    if header_id:
+        chat_id = header_id
+        m = cx.lcp_len(_chain(user_id, chat_id, n + 1), hashes)
+    else:
+        best_cont, best_part = None, None
+        for (cid,) in _conn.execute("SELECT chat_id FROM chat_chain WHERE user_id=? AND pos=0 AND msg_hash=?",
+                                    (user_id, hashes[0])).fetchall():
+            chain = _chain(user_id, cid, n + 1)
+            ts = _conn.execute("SELECT MAX(ts) FROM chat_chain WHERE user_id=? AND chat_id=?", (user_id, cid)).fetchone()[0] or 0
+            m = cx.lcp_len(chain, hashes)
+            if m == len(chain):
+                if best_cont is None or (m, ts) > best_cont[:2]: best_cont = (m, ts, cid)
+            elif m >= 2:
+                if best_part is None or (m, ts) > best_part[:2]: best_part = (m, ts, cid)
+        pick = best_cont or best_part
+        if pick:
+            m, _, chat_id = pick
+        else:
+            used = _conn.execute("SELECT 1 FROM chat_chain WHERE user_id=? AND chat_id=? LIMIT 1", (user_id, legacy_id)).fetchone()
+            chat_id = legacy_id if not used else "auto-" + hashlib.sha1(
+                f"{legacy_id}\x00{now}\x00{random.random()}".encode()).hexdigest()[:12]
+            m = 0
+    with _conn:
+        _conn.execute("DELETE FROM chat_chain WHERE user_id=? AND chat_id=? AND pos>=?", (user_id, chat_id, m))
+        _conn.executemany("INSERT INTO chat_chain(user_id, chat_id, pos, msg_hash, ts) VALUES (?,?,?,?,?)",
+                          [(user_id, chat_id, i, hashes[i], now) for i in range(m, n)])
+        if m == n:
+            _conn.execute("UPDATE chat_chain SET ts=? WHERE user_id=? AND chat_id=? AND pos=?", (now, user_id, chat_id, n - 1))
+    return chat_id, m < n
+
+def other_users_with_data() -> list:
+    return [r[0] for r in _conn.execute(
+        "SELECT user_id FROM (SELECT DISTINCT user_id FROM messages UNION SELECT DISTINCT user_id FROM facts) "
+        "WHERE user_id != ? ORDER BY user_id", (OWNER,))]
+
+# ─── v5: бэкенд (лимит контекста, шаблон) ───
+TOKENS = cx.TokenCounter(CHARS_PER_TOKEN)
+BACKENDS = {}             # model → {"n_ctx", "src", "system_mode", "date_kw", "probed", "ts"}
+CTX_ERR = re.compile(r"(?:maximum context length|context (?:length|size|window)|n_ctx)\D{0,40}?(\d{3,7})", re.I)
+STATS = {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "epoch_switch": 0, "epoch_sync": 0,
+         "oversize": 0, "ctx_retry": 0, "invariant_fallback": 0, "warmup": 0, "summaries": 0}
+
+def model_override(model: str) -> dict:
+    for rx, prof in MODEL_PROFILES.items():
+        if rx.search(model or ""): return prof
+    return {}
+
+async def _probe_template(http: httpx.AsyncClient) -> str:
+    """llama.cpp /apply-template: нужен ли перенос system в первое сообщение (нет system / шаблон его двигает)."""
+    sys_t = "PROBE-SYSTEM-7f3a"
+    conv = [{"role": "system", "content": sys_t}, {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"}]
+    try:
+        r1 = await http.post(BACKEND_BASE + "/apply-template", json={"messages": conv}, timeout=3.0)
+        if r1.status_code == 404: return "native"
+        if r1.status_code != 200: return "first_user"           # шаблон отверг system
+        r2 = await http.post(BACKEND_BASE + "/apply-template", timeout=3.0, json={
+            "messages": conv + [{"role": "assistant", "content": "a2"}, {"role": "user", "content": "u3"}]})
+        p1, p2 = r1.json().get("prompt", ""), r2.json().get("prompt", "")
+        if sys_t not in p1: return "first_user"
+        return "native" if p1.find(sys_t) == p2.find(sys_t) else "first_user"
+    except Exception:
+        return "native"
+
+async def backend_info(http: httpx.AsyncClient, model: str) -> dict:
+    info = BACKENDS.get(model)
+    if info and (info["probed"] or time.time() - info["ts"] < 600): return info
+    ov = model_override(model)
+    info = {"n_ctx": int(ov.get("context_limit") or CONTEXT_LIMIT or 0), "src": "env" if (ov.get("context_limit") or CONTEXT_LIMIT) else "",
+            "system_mode": ov.get("system_mode", ""), "date_kw": False, "probed": True, "ts": time.time()}
+    template = ""
+    try:
+        r = await http.get(BACKEND_BASE + "/props", timeout=2.0)
+        if r.status_code == 200:
+            j = r.json()
+            template = j.get("chat_template") or ""
+            if not info["n_ctx"]:
+                n = (j.get("default_generation_settings") or {}).get("n_ctx") or j.get("n_ctx")
+                if isinstance(n, int) and n > 0: info["n_ctx"], info["src"] = n, "llama.cpp /props"
+        if not info["n_ctx"]:
+            r = await http.get(BACKEND_BASE + "/v1/models", timeout=2.0)
+            if r.status_code == 200:
+                for d in r.json().get("data") or []:
+                    if isinstance(d, dict) and (d.get("id") == model or not model) and isinstance(d.get("max_model_len"), int):
+                        info["n_ctx"], info["src"] = d["max_model_len"], "/v1/models max_model_len"; break
+    except Exception as e:
+        info["probed"] = False
+        log.info(f"[Backend] limit discovery failed: {e}")
+    if not info["system_mode"]:
+        info["system_mode"] = await _probe_template(http) if template else "native"
+    info["date_kw"] = "strftime_now" in template and "date_string" in template
+    if isinstance(ov.get("chars_per_token"), (int, float)) and ov["chars_per_token"] > 0:
+        TOKENS.factor[model] = CHARS_PER_TOKEN / float(ov["chars_per_token"])
+    BACKENDS[model] = info
+    log.info(f"[Backend] model={model or '-'} n_ctx={info['n_ctx'] or '?'} ({info['src'] or 'unknown'}), "
+             f"system_mode={info['system_mode']}, date_kw={info['date_kw']}")
+    return info
+
+def learn_context_error(model: str, status: int, content: bytes) -> bool:
+    """400 «контекст переполнен» → запомнить реальный n_ctx. True, если узнали что-то новое."""
+    if status not in (400, 413, 422): return False
+    try:
+        j = orjson.loads(content)
+        e = j.get("error", j) if isinstance(j, dict) else {}
+        n = e.get("n_ctx") if isinstance(e, dict) else None
+        msg = (e.get("message") if isinstance(e, dict) else "") or ""
+    except Exception:
+        n, msg = None, content[:2000].decode("utf-8", "ignore")
+    if not isinstance(n, int):
+        if "exceed" not in msg.lower() and "context" not in msg.lower(): return False
+        m = CTX_ERR.search(msg)
+        n = int(m.group(1)) if m else None
+    info = BACKENDS.setdefault(model, {"n_ctx": 0, "src": "", "system_mode": "native", "date_kw": False, "probed": True, "ts": time.time()})
+    if isinstance(n, int) and n > 0 and (not info["n_ctx"] or n < info["n_ctx"]):
+        info["n_ctx"], info["src"] = n, "learned from 400"
+        log.warning(f"[Backend] model={model or '-'}: context limit learned from error: n_ctx={n}")
+        return True
+    if not isinstance(n, int) and info.get("n_ctx"):
+        info["n_ctx"] = int(info["n_ctx"] * 0.8); info["src"] = "shrunk after 400"
+        return True
+    return False
+
+def budget(info: dict, body: dict, model: str) -> int:
+    """Сколько токенов можно отдать под сообщения: min(COMPRESS_AT, 0.9·n_ctx − резерв ответа) − tools."""
+    tools = TOKENS.tools(body.get("tools"), model)
+    mt = body.get("max_tokens") or body.get("max_completion_tokens")
+    reserve = mt if isinstance(mt, int) and mt > 0 else ANSWER_RESERVE
+    n = info.get("n_ctx") or 0
+    if n:
+        b = int(n * 0.9) - min(reserve, n // 4)
+        if COMPRESS_AT > 0: b = min(b, COMPRESS_AT)
+    else:
+        b = COMPRESS_AT if COMPRESS_AT > 0 else 16000      # лимит узнаем из первой ошибки 400
+    return max(256, b - tools)
+
+# ─── v5: память — профиль эпохи и закреплённые дельты ───
+def search_facts(user_text: str, user_id: str, chat_id: str, qv: bytes = None) -> list:
+    """[(id, predicate, object, valid_from, evidence)] по FTS + векторам (RRF)."""
+    words = _search_words(user_text)
+    scope_sql, scope_p = ("", []) if GLOBAL_MEMORY else (" AND f.scope = ?", [chat_id])
+    score, meta = {}, {}
+    if words:
+        try:
+            rows = _conn.execute(
+                "SELECT f.id, f.predicate, f.object, f.valid_from, f.evidence FROM facts_fts fts JOIN facts f ON f.id = fts.rowid "
+                f"WHERE facts_fts MATCH ? AND f.valid_to IS NULL AND f.user_id = ?{scope_sql} "
+                "ORDER BY bm25(facts_fts) LIMIT 20", [" OR ".join(words), user_id, *scope_p]).fetchall()
+            for i, r in enumerate(rows):
+                meta[r[0]] = r; score[r[0]] = score.get(r[0], 0) + 1.0 / (61 + i)
+        except Exception as e: log.warning(f"FTS: {e}")
+    if qv is not None:
+        try:
+            k = 20 if GLOBAL_MEMORY else 60
+            rows = _conn.execute(
+                "SELECT v.rowid, f.predicate, f.object, f.valid_from, f.evidence FROM vec_facts v JOIN facts f ON f.id = v.rowid "
+                f"WHERE v.embedding MATCH ? AND k = ? AND v.user_id = ? AND f.valid_to IS NULL{scope_sql} "
+                "ORDER BY v.distance", [qv, k, user_id, *scope_p]).fetchall()
+            for i, r in enumerate(rows[:20]):
+                meta[r[0]] = r; score[r[0]] = score.get(r[0], 0) + 1.0 / (61 + i)
+        except Exception as e: log.warning(f"Vec: {e}")
+    return [meta[f] for f in sorted(score, key=lambda f: (-score[f], f))][:15]
+
+def build_profile(user_id: str, chat_id: str):
+    """Профиль эпохи: снимок долгоживущей памяти. Детерминирован (никаких RANDOM и времени внутри эпохи)."""
+    scope_sql, scope_p = ("", []) if GLOBAL_MEMORY else (" AND scope = ?", [chat_id])
+    rows = _conn.execute(f"SELECT id, predicate, object FROM facts WHERE user_id=? AND valid_to IS NULL{scope_sql} "
+                         "ORDER BY ts DESC, id DESC LIMIT 60", [user_id, *scope_p]).fetchall()
+    parts, ids, lines, used = [], [], [], 0
+    for fid, p, o in rows:
+        line = f"- {p}: {neutralize(o)}"
+        if used + len(line) > PROFILE_CH * 0.6: break
+        lines.append(line); ids.append(fid); used += len(line) + 1
+    if lines: parts.append("[ПРОФИЛЬ: ФАКТЫ О ПОЛЬЗОВАТЕЛЕ]\n" + "\n".join(lines))
+    emo = get_emotion_lines(user_id, chat_id)
+    if emo: parts.append("[ОТНОШЕНИЕ К ТЕМАМ]\n" + "\n".join(emo))
+    st = _conn.execute("SELECT text FROM style_examples WHERE user_id=? AND score >= 0 AND context IN ('personal','mixed') "
+                       "ORDER BY score DESC, ts DESC, id DESC LIMIT 2", (user_id,)).fetchall()
+    if st: parts.append("[ПРИМЕРЫ ТВОИХ ПРОШЛЫХ ОТВЕТОВ]\n" + "\n---\n".join(neutralize(r[0])[:300] for r in st))
+    text = "\n\n".join(parts)
+    return text[:PROFILE_CH], ids
+
+def _cap_lines(lines: list, limit: int) -> list:
+    out, used = [], 0
+    for ln in lines:
+        if used + len(ln) > limit and out: break
+        out.append(ln[:limit]); used += len(ln) + 1
+    return out
+
+def recall_lines(user_id: str, chat_id: str, query: str, window_keys: set, seen: str = "", window_lower: str = "") -> str:
+    """Фрагменты отрезанной части этого чата под текущий вопрос (§5.9).
+
+    Ищем только по словам вопроса, которых нет в окне: recall нужен для того, что модель уже не видит;
+    общие слова («детали», «подробнее») иначе тянут одни и те же цитаты к каждому вопросу. Фрагмент —
+    окрестность совпадения (snippet), а не начало сообщения; показанный в окне фрагмент не повторяется."""
+    words = [w for w in _search_words(query) if w not in window_lower]
+    if not words or not RECALL_K: return ""
+    try:
+        rows = _conn.execute(
+            "SELECT m.content, m.role, snippet(messages_fts, -1, '', '', '…', 40) FROM messages_fts f "
+            f"JOIN messages m ON f.rowid = m.id WHERE messages_fts MATCH ? AND m.user_id = ? AND m.chat_id = ? AND {NOT_CMD} "
+            "ORDER BY bm25(messages_fts) LIMIT 20", (" OR ".join(f'"{w}"' for w in words), user_id, chat_id)).fetchall()
+    except Exception as e:
+        log.warning(f"Recall: {e}"); return ""
+    out = []
+    for content, role, snip in rows:
+        if not content or content.strip()[:200] in window_keys: continue
+        who = "пользователь" if role == "user" else "ассистент"
+        frag = (snip or content).strip()
+        line = f"- {who}: «{neutralize(frag).replace('```', chr(39) * 3)[:300]}»"
+        if line[:120] in seen: continue
+        out.append(line)
+        if len(out) >= RECALL_K: break
+    return "[ИЗ НАЧАЛА ЭТОГО ЧАТА]\n" + "\n".join(out) if out else ""
+
+def build_delta(user_id: str, chat_id: str, text: str, qv, exclude: set, window_lower: str,
+                window_keys: set, recall: bool, seen_memory: str = "", visible_lower: str = ""):
+    """Дельта памяти к новому вопросу: только то, чего модель ещё не видит. → (текст, [fact_id])."""
+    facts = []
+    for fid, p, o, vf, ev in search_facts(text, user_id, chat_id, qv):
+        if fid in exclude: continue
+        if isinstance(ev, str) and len(ev) >= 8 and ev.lower() in window_lower: continue   # сказано в окне
+        facts.append((fid, p, o, vf))
+    facts = facts[:10]
+    lines = []
+    if facts:
+        lines.append("[ТЕКУЩИЕ ФАКТЫ]")
+        lines += [f"- {p}: {neutralize(o)}" + (f" (с {_fmt_day(vf)})" if vf else "") for _, p, o, vf in facts]
+    if re.search(r"\b(раньше|прежде|в прошлом|помнишь|история)\b", text, re.I):
+        scope_sql, scope_p = ("", []) if GLOBAL_MEMORY else (" AND scope = ?", [chat_id])
+        hist = _conn.execute(f"SELECT predicate, object, valid_from, valid_to FROM facts WHERE valid_to IS NOT NULL "
+                             f"AND user_id = ?{scope_sql} ORDER BY valid_to DESC LIMIT 10", [user_id, *scope_p]).fetchall()
+        if hist:
+            lines.append("[ИСТОРИЯ]")
+            lines += [f"- {p}: {neutralize(o)} ({_fmt_day(vf)} → {_fmt_day(vt)})" for p, o, vf, vt in hist]
+    # отношение к темам, появившееся после сборки профиля и ещё не показанное в окне
+    decayed = get_emotions(user_id, chat_id)
+    seen = seen_memory.lower()
+    pos = [neutralize(t) for t, sc in decayed if sc > 0.5 and t.lower() not in seen][:10]
+    neg = [neutralize(t) for t, sc in decayed if sc < -0.5 and t.lower() not in seen][:10]
+    if pos or neg:
+        lines.append("[ОТНОШЕНИЕ К ТЕМАМ]")
+        if pos: lines.append(f"Позитив: {', '.join(pos)}")
+        if neg: lines.append(f"Негатив: {', '.join(neg)}")
+    parts = ["\n".join(_cap_lines(lines, DELTA_CH))] if lines else []
+    if GLOBAL_MEMORY and CROSS_CHAT_TRIGGERS.search(text):
+        cross = search_other_chats(text, user_id, chat_id, limit=5)
+        if cross: parts.append("\n".join(_cap_lines(cross.split("\n"), 1200)))
+    if recall:
+        rc = recall_lines(user_id, chat_id, text, window_keys, seen_memory, visible_lower)
+        if rc: parts.append(rc)
+    return "\n\n".join(p for p in parts if p), [f[0] for f in facts]
+
+def pin_delta(user_id: str, chat_id: str, h: str, delta: str, ids: list):
+    with _conn:
+        _conn.execute("INSERT OR IGNORE INTO pinned_deltas(user_id, chat_id, msg_hash, delta, fact_ids, created) "
+                      "VALUES (?,?,?,?,?,?)", (user_id, chat_id, h, delta, json.dumps(ids), time.time()))
+    row = _conn.execute("SELECT delta FROM pinned_deltas WHERE user_id=? AND chat_id=? AND msg_hash=?",
+                        (user_id, chat_id, h)).fetchone()
+    return row[0] if row else delta
+
+EPOCH_COLS = "epoch_id, cut_pos, cut_hash, elide_pos, summary, profile, profile_facts, memory, date_string, state"
+
+def _epoch_row(r) -> dict:
+    if not r: return None
+    d = dict(zip([c.strip() for c in EPOCH_COLS.split(",")], r))
+    d["profile_facts"] = set(json.loads(d["profile_facts"] or "[]"))
+    return d
+
+def create_epoch(user_id: str, chat_id: str, cut_pos: int, cut_hash: str, elide_pos: int, summary: str,
+                 memory: bool, state: str = "active") -> dict:
+    profile, ids = build_profile(user_id, chat_id) if memory else ("", [])
+    with _conn:
+        nxt = (_conn.execute("SELECT MAX(epoch_id) FROM chat_epochs WHERE user_id=? AND chat_id=?",
+                             (user_id, chat_id)).fetchone()[0] or 0) + 1
+        if state == "active":
+            _conn.execute("DELETE FROM chat_epochs WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+        else:
+            _conn.execute("DELETE FROM chat_epochs WHERE user_id=? AND chat_id=? AND state != 'active'", (user_id, chat_id))
+        _conn.execute(f"INSERT INTO chat_epochs(user_id, chat_id, {EPOCH_COLS}, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (user_id, chat_id, nxt, cut_pos, cut_hash, elide_pos, summary or "", profile, json.dumps(ids),
+                       int(bool(memory)), time.strftime("%d %b %Y"), state, time.time()))
+    return _epoch_row(_conn.execute(f"SELECT {EPOCH_COLS} FROM chat_epochs WHERE user_id=? AND chat_id=? AND epoch_id=?",
+                                    (user_id, chat_id, nxt)).fetchone())
+
+def activate_epoch(user_id: str, chat_id: str, epoch_id: int):
+    with _conn:
+        _conn.execute("DELETE FROM chat_epochs WHERE user_id=? AND chat_id=? AND epoch_id != ?", (user_id, chat_id, epoch_id))
+        _conn.execute("UPDATE chat_epochs SET state='active' WHERE user_id=? AND chat_id=? AND epoch_id=?",
+                      (user_id, chat_id, epoch_id))
+
+def load_state(user_id: str, chat_id: str, hashes: list, memory_default: bool) -> dict:
+    """Активная эпоха (создаётся при первом запросе), готовая следующая и закреплённые дельты окна."""
+    rows = [_epoch_row(r) for r in _conn.execute(
+        f"SELECT {EPOCH_COLS} FROM chat_epochs WHERE user_id=? AND chat_id=? ORDER BY epoch_id", (user_id, chat_id))]
+    active = next((e for e in rows if e["state"] == "active"), None)
+    ready = next((e for e in rows if e["state"] == "ready"), None)
+    if active and active["cut_pos"] > 0:
+        cp = active["cut_pos"]
+        if not (cp < len(hashes) and hashes[cp] == active["cut_hash"]):
+            cp = hashes.index(active["cut_hash"]) if active["cut_hash"] in hashes else -1
+            if cp < 0:
+                active = None                         # история изменена до границы окна — новая эпоха
+            else:
+                active["cut_pos"] = cp
+    if active and active["profile"] is None:          # после /forget
+        active["profile"], ids = build_profile(user_id, chat_id) if active["memory"] else ("", [])
+        active["profile_facts"] = set(ids)
+        with _conn:
+            _conn.execute("UPDATE chat_epochs SET profile=?, profile_facts=? WHERE user_id=? AND chat_id=? AND epoch_id=?",
+                          (active["profile"], json.dumps(ids), user_id, chat_id, active["epoch_id"]))
+    if not active:
+        active = create_epoch(user_id, chat_id, 0, hashes[0] if hashes else "", 0, "", memory_default)
+        ready = None
+    deltas = {}
+    win = hashes[active["cut_pos"]:]
+    for i in range(0, len(win), 500):
+        chunk = win[i:i + 500]
+        for h, d, fids in _conn.execute(
+                f"SELECT msg_hash, delta, fact_ids FROM pinned_deltas WHERE user_id=? AND chat_id=? AND msg_hash IN "
+                f"({','.join('?' * len(chunk))})", (user_id, chat_id, *chunk)):
+            deltas[h] = (d, set(json.loads(fids or "[]")))
+    return {"active": active, "ready": ready, "deltas": deltas}
+
+# ─── v5: фоновые задачи уступают пользователю ───
+class BackgroundGate:
+    """Фоновые LLM-запросы (саммари, прогрев) ждут, пока нет пользовательских запросов, и отменяются,
+    когда пользовательский запрос приходит (BACKGROUND_PREEMPT): у локальной модели один слот."""
+    def __init__(self):
+        self.active, self.running, self.idle = 0, set(), None
+
+    def _ev(self):
+        if self.idle is None:
+            self.idle = asyncio.Event(); self.idle.set()
+        return self.idle
+
+    def user_start(self):
+        self.active += 1; self._ev().clear()
+        if BACKGROUND_PREEMPT:
+            for t in list(self.running): t.cancel()
+
+    def user_end(self):
+        self.active = max(0, self.active - 1)
+        if not self.active: self._ev().set()
+
+    async def run(self, factory, attempts: int = 4):
+        for _ in range(attempts):
+            await self._ev().wait()
+            t = asyncio.ensure_future(factory())
+            self.running.add(t)
+            try:
+                return await t
+            except asyncio.CancelledError:
+                me = asyncio.current_task()
+                if me is not None and me.cancelling(): raise
+                log.info("[Background] preempted by a user request, will retry")
+            finally:
+                self.running.discard(t)
+        return None
+
+GATE = BackgroundGate()
+PREPARING = set()         # (user_id, chat_id) — эпоха готовится
+
+def _transcript(msgs: list) -> str:
+    who = {"user": "Пользователь", "assistant": "Ассистент", "tool": "Инструмент"}
+    out = []
+    for m in msgs:
+        t = cx.content_text(m.get("content"))
+        if m.get("role") == "assistant": t = cx.strip_think(t)
+        if m.get("tool_calls"):
+            t += " [вызов: " + ", ".join(str((tc.get("function") or {}).get("name")) for tc in m["tool_calls"]
+                                          if isinstance(tc, dict)) + "]"
+        lim = 500 if m.get("role") == "tool" else 1500
+        if t.strip(): out.append(f"{who.get(m.get('role'), m.get('role'))}: {cx.truncate_middle(t.strip(), lim)}")
+    return "\n".join(out)
+
+def build_summary_payload(prev: str, transcript: str, model: str) -> dict:
+    prompt = ("Ты ведёшь краткое содержание длинного разговора пользователя с ассистентом. Обнови его так, "
+              "чтобы по нему можно было продолжить разговор без исходного текста.\n"
+              "Сохрани: факты о пользователе, принятые решения, договорённости, имена, числа, даты, названия файлов "
+              "и команд, нерешённые вопросы. Убери приветствия и повторы. Пиши по-русски, сжато, маркированным "
+              f"списком, не длиннее {SUMMARY_MAX_CH // 2} символов. Верни только содержание.\n\n"
+              f"Текущее содержание:\n{prev or '(пусто)'}\n\nНовая часть разговора:\n{transcript}")
+    p = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 700, "stream": False}
+    if SUMMARY_MODEL or model: p["model"] = SUMMARY_MODEL or model
+    return p
+
+async def _summary_call(http: httpx.AsyncClient, prev: str, transcript: str, model: str):
+    async def call():
+        r = await http.post(SUMMARY_URL, json=build_summary_payload(prev, transcript, model), timeout=600.0)
+        if r.status_code != 200: raise RuntimeError(f"status {r.status_code}")
+        return cx.strip_think(r.json()["choices"][0]["message"]["content"] or "")
+    return await GATE.run(call)
+
+async def summarize(http: httpx.AsyncClient, prev: str, msgs: list, model: str) -> str:
+    """Инкрементальное саммари; очень длинный кусок — map-reduce (§5.10)."""
+    tr = _transcript(msgs)
+    if not tr: return prev
+    if len(tr) > SUMMARY_INPUT_MAX:
+        parts, chunk = [], []
+        for line in tr.split("\n"):
+            if chunk and sum(len(x) for x in chunk) + len(line) > SUMMARY_INPUT_MAX:
+                parts.append("\n".join(chunk)); chunk = []
+            chunk.append(line)
+        if chunk: parts.append("\n".join(chunk))
+        partial = []
+        for p in parts:
+            s = await _summary_call(http, "", p, model)
+            if not (s or "").strip(): return None
+            partial.append(s)
+        tr = "\n".join(partial)
+    s = await _summary_call(http, prev, tr, model)
+    if len((s or "").strip()) < 24: return None          # отказ, пустой или мусорный ответ («0») → L3-фолбэк
+    STATS["summaries"] += 1
+    return s[:SUMMARY_MAX_CH]
+
+def fallback_summary(prev: str, dropped: list) -> str:
+    """L3: без LLM — прошлое саммари + начала отрезанных вопросов пользователя."""
+    qs = [cx.truncate_middle(cx.content_text(m.get("content")).strip().replace("\n", " "), 120)
+          for m in dropped if m.get("role") == "user" and cx.content_text(m.get("content")).strip()]
+    frag = "Ранее пользователь спрашивал: " + "; ".join(f"«{q}»" for q in qs[-8:]) if qs else ""
+    s = "\n".join(x for x in (prev, frag) if x)
+    return s[-SUMMARY_MAX_CH:] if len(s) > SUMMARY_MAX_CH else s
+
+# ─── v5: сборка запроса (горячий путь) ───
+class Plan:
+    """Всё, что нужно для сборки промпта одного запроса."""
+    def __init__(self, sys_msgs: list, non_sys: list, model: str, info: dict, body: dict):
+        self.sys, self.non_sys, self.model, self.info = sys_msgs, non_sys, model, info
+        # поля, от которых зависит отрендеренный промпт: прогрев должен совпасть с настоящим запросом
+        self.prompt_fields = {k: body[k] for k in ("tools", "tool_choice", "parallel_tool_calls", "chat_template_kwargs",
+                                                   "reasoning_effort") if body.get(k) is not None}
+        self.hashes = cx.history_hashes(non_sys)
+        self.B = budget(info, body, model)
+        self.lu = cx.last_user_index(non_sys)
+        self.tok = [TOKENS.message(m, model) for m in non_sys]
+        self.sys_tok = TOKENS.messages(sys_msgs, model) + TOKENS.text(MEMORY_POLICY, model)
+
+    def suffix(self, deltas_text: dict) -> list:
+        """suf[i] — токены окна, начинающегося с i (без head)."""
+        suf = [0] * (len(self.non_sys) + 1)
+        for i in range(len(self.non_sys) - 1, -1, -1):
+            d = deltas_text.get(self.hashes[i], "") if self.non_sys[i].get("role") == "user" else ""
+            suf[i] = suf[i + 1] + self.tok[i] + (TOKENS.text(d, self.model) + 6 if d else 0)
+        return suf
+
+def epoch_head(e: dict) -> str:
+    parts = []
+    if e.get("summary"): parts.append("[КРАТКОЕ СОДЕРЖАНИЕ НАЧАЛА ЭТОГО ЧАТА]\n" + neutralize(e["summary"]))
+    if e.get("profile"): parts.append(e["profile"])
+    return "\n\n".join(parts)
+
+def render(plan: Plan, e: dict, deltas_text: dict) -> list:
+    head = epoch_head(e)
+    cut = e["cut_pos"]
+    has_mem = bool(head) or any(deltas_text.get(h) for h in plan.hashes[cut:])
+    return cx.assemble(plan.sys, plan.non_sys, cut, head=head, deltas=deltas_text, hashes=plan.hashes,
+                       policy=MEMORY_POLICY if has_mem else "", system_mode=plan.info.get("system_mode", "native"),
+                       elide_before=e.get("elide_pos", 0))
+
+def plan_cut(plan: Plan, e: dict, deltas_text: dict, target: int) -> int:
+    """Новая граница окна (по ходу), чтобы окно с саммари и профилем уложилось в target."""
+    suf = plan.suffix(deltas_text)
+    # голова новой эпохи: прошлое саммари + прирост, профиль — по фактическому размеру с запасом
+    # (резерв «по максимуму» сжимал окно до одного хода, и эпохи менялись каждый ход при малом бюджете)
+    head_ch = min(SUMMARY_MAX_CH, len(e.get("summary") or "") + 800) + \
+              (min(PROFILE_CH, len(e.get("profile") or "") + 300) if e.get("memory") else 0)
+    head_tok = TOKENS.text("x" * head_ch, plan.model) + 40
+    if plan.lu is None: return e["cut_pos"]
+    c = cx.choose_cut(plan.non_sys, e["cut_pos"] + 1, lambda c: plan.sys_tok + head_tok + suf[c] <= target)
+    return min(c, plan.lu)
+
+def elide_from(plan: Plan, cut: int) -> int:
+    ups = [i for i in cx.user_positions(plan.non_sys) if i >= cut]
+    return ups[-ELIDE_KEEP_TURNS] if len(ups) >= ELIDE_KEEP_TURNS else cut
+
+async def sync_shift(user_id: str, chat_id: str, plan: Plan, e: dict, deltas_text: dict) -> dict:
+    """Окно не помещается, а готовой эпохи нет: новая эпоха без LLM (L1 + L3), один раз ломает префикс."""
+    c = plan_cut(plan, e, deltas_text, int(EPOCH_TARGET * plan.B))
+    if c <= e["cut_pos"]: return e
+    summary = fallback_summary(e.get("summary", ""), plan.non_sys[e["cut_pos"]:c])
+    STATS["epoch_sync"] += 1
+    log.info(f"[Context] sync epoch shift chat={chat_id[:12]} cut {e['cut_pos']}→{c}")
+    if user_id is None:                                  # legacy: без сохранения
+        return {**e, "cut_pos": c, "summary": summary, "elide_pos": elide_from(plan, c)}
+    return await db(create_epoch, user_id, chat_id, c, plan.hashes[c], elide_from(plan, c), summary, e["memory"], "active")
+
+async def prepare_epoch(http: httpx.AsyncClient, user_id: str, chat_id: str, plan: Plan, e: dict, deltas_text: dict):
+    """Фон: граница, LLM-саммари, профиль → прогрев нового префикса → эпоха 'ready'."""
+    key = (user_id, chat_id)
+    try:
+        c = plan_cut(plan, e, deltas_text, int(EPOCH_TARGET * plan.B))
+        if c <= e["cut_pos"]: return
+        dropped = plan.non_sys[e["cut_pos"]:c]
+        summary = await summarize(http, e.get("summary", ""), dropped, plan.model) if SUMMARY else None
+        if summary is None: summary = fallback_summary(e.get("summary", ""), dropped)
+        new = await db(create_epoch, user_id, chat_id, c, plan.hashes[c], elide_from(plan, c), summary, e["memory"], "preparing")
+        if WARMUP:
+            body = {**plan.prompt_fields, "messages": render(plan, new, deltas_text), "max_tokens": 1, "temperature": 0,
+                    "stream": False}
+            if plan.model: body["model"] = plan.model
+            if plan.info.get("date_kw"):
+                body["chat_template_kwargs"] = {"date_string": new["date_string"], **(body.get("chat_template_kwargs") or {})}
+            r = await GATE.run(lambda: http.post(LLAMA_URL, json=body, timeout=900.0))
+            if r is not None: STATS["warmup"] += 1
+        await db(mark_ready, user_id, chat_id, new["epoch_id"])
+        log.info(f"[Context] epoch ready chat={chat_id[:12]} cut {e['cut_pos']}→{c}, summary {len(summary)} ch")
+    except Exception as ex:
+        log.warning(f"[Context] prepare epoch: {ex}")
+    finally:
+        PREPARING.discard(key)
+
+def mark_ready(user_id: str, chat_id: str, epoch_id: int):
+    with _conn:
+        _conn.execute("UPDATE chat_epochs SET state='ready' WHERE user_id=? AND chat_id=? AND epoch_id=? AND state='preparing'",
+                      (user_id, chat_id, epoch_id))
+
+def schedule_task(app_: FastAPI, coro):
+    t = asyncio.create_task(coro)
+    app_.state.bg.add(t)
+    t.add_done_callback(app_.state.bg.discard)
+    return t
+
+async def build_messages(request: Request, http: httpx.AsyncClient, plan: Plan, user_id: str, chat_id: str,
+                         memory_on: bool, delta_args, legacy_block: str = ""):
+    """Собирает промпт v5. Возвращает (messages, epoch) или (None, текст отказа) при OVERSIZE=reject."""
+    if CONTEXT_MODE == "legacy":
+        e = {"cut_pos": 0, "summary": "", "profile": "", "elide_pos": 0, "memory": True}
+        deltas_text = {plan.hashes[plan.lu]: legacy_block} if legacy_block and plan.lu is not None else {}
+        msgs = render(plan, e, deltas_text)
+        if TOKENS.messages(msgs, plan.model) > plan.B:
+            e = await sync_shift(None, chat_id, plan, e, deltas_text)
+            msgs = render(plan, e, deltas_text)
+        return await fit_oversize(plan, e, msgs, deltas_text)
+
+    st = await db(load_state, user_id, chat_id, plan.hashes, memory_on)
+    e, ready = st["active"], st["ready"]
+    deltas_text = {h: d for h, (d, _) in st["deltas"].items()}
+    # новая дельта — только для нового вопроса пользователя (шаги агента и перегенерация берут закреплённую)
+    if plan.lu is not None and plan.hashes[plan.lu] not in st["deltas"] and plan.lu >= e["cut_pos"]:
+        delta = ""
+        if delta_args is not None and e["memory"]:
+            text, qv_coro = delta_args
+            qv = await qv_coro()
+            exclude = set(e["profile_facts"])
+            for _, ids in st["deltas"].values(): exclude |= ids
+            win = plan.non_sys[e["cut_pos"]:]
+            window_lower = "\n".join(cx.content_text(m.get("content")) for m in win if m.get("role") == "user").lower()[:400000]
+            keys = {clean_client_text(cx.content_text(m.get("content")))[:200] for m in win if m.get("role") == "user"} | \
+                   {cx.strip_think(cx.content_text(m.get("content")))[:200] for m in win if m.get("role") == "assistant"}
+            seen = (e.get("profile") or "") + "\n" + "\n".join(d for d, _ in st["deltas"].values())
+            # что модель уже видит, кроме самого вопроса: окно до него, саммари и дельты
+            visible = "\n".join(cx.content_text(m.get("content")) for m in win[:plan.lu - e["cut_pos"]])
+            visible = (visible + "\n" + (e.get("summary") or "") + "\n" + seen).lower()[-400000:]
+            delta, ids = await db(build_delta, user_id, chat_id, text, qv, exclude, window_lower, keys,
+                                  RECALL and e["cut_pos"] > 0, seen, visible)
+            delta = await db(pin_delta, user_id, chat_id, plan.hashes[plan.lu], delta, ids)
+        deltas_text[plan.hashes[plan.lu]] = delta
+
+    msgs = render(plan, e, deltas_text)
+    n = TOKENS.messages(msgs, plan.model)
+    # готовая эпоха: переключаемся на первом же запросе — её префикс уже прогрет
+    if ready and ready["cut_hash"] in plan.hashes and plan.lu is not None and plan.hashes.index(ready["cut_hash"]) <= plan.lu:
+        ready["cut_pos"] = plan.hashes.index(ready["cut_hash"])
+        await db(activate_epoch, user_id, chat_id, ready["epoch_id"])
+        STATS["epoch_switch"] += 1
+        log.info(f"[Context] switch to prepared epoch chat={chat_id[:12]} cut→{ready['cut_pos']}")
+        e = ready
+        msgs = render(plan, e, deltas_text); n = TOKENS.messages(msgs, plan.model)
+    if n > EPOCH_AT * plan.B:
+        e = await sync_shift(user_id, chat_id, plan, e, deltas_text)
+        msgs = render(plan, e, deltas_text); n = TOKENS.messages(msgs, plan.model)
+    if n > EPOCH_PREP_AT * plan.B and (user_id, chat_id) not in PREPARING and not (ready and e is not ready):
+        PREPARING.add((user_id, chat_id))
+        schedule_task(request.app, prepare_epoch(http, user_id, chat_id, plan, e, dict(deltas_text)))
+    return await fit_oversize(plan, e, msgs, deltas_text)
+
+async def fit_oversize(plan: Plan, e: dict, msgs: list, deltas_text: dict):
+    if TOKENS.messages(msgs, plan.model) <= plan.B: return msgs, e
+    STATS["oversize"] += 1
+    if OVERSIZE == "reject":
+        need = TOKENS.messages(msgs, plan.model)
+        return None, (f"⚠️ Текущее сообщение слишком большое для контекста модели: ~{need} токенов при доступных "
+                      f"~{plan.B}. Сократите сообщение или вложения, либо увеличьте контекст модели (CONTEXT_LIMIT).")
+    sys_n = sum(1 for m in msgs if m.get("role") in ("system", "developer"))
+    body_msgs = msgs[sys_n:]
+    start = max(0, (plan.lu - e["cut_pos"]) if plan.lu is not None else 0)
+    shrunk = cx.shrink_turn(body_msgs, start, plan.B - TOKENS.messages(msgs[:sys_n], plan.model), TOKENS, plan.model)
+    log.warning(f"[Context] oversize: current turn truncated to fit ~{plan.B} tokens")
+    return msgs[:sys_n] + shrunk, e
+
 # ─── HTTP ───
 def json_error(msg: str, status: int) -> Response:
     return Response(orjson.dumps({"error": msg}), status_code=status, media_type="application/json")
 
-async def forward(http: httpx.AsyncClient, body: dict, on_complete=None) -> Response:
-    """Проксирует запрос в LLM (stream и non-stream). on_complete(text) вызывается с полным ответом."""
+def _usage_of(d: dict):
+    u = d.get("usage") if isinstance(d.get("usage"), dict) else None
+    t = d.get("timings") if isinstance(d.get("timings"), dict) else None
+    return u, t
+
+async def forward(http: httpx.AsyncClient, body: dict, on_complete=None, on_usage=None, on_finish=None) -> Response:
+    """Проксирует запрос в LLM (stream и non-stream). on_complete(text) — полный ответ, on_usage(usage, timings) —
+    статистика промпта, on_finish() — запрос завершён (после стрима)."""
+    def finish():
+        if on_finish is not None:
+            try: on_finish()
+            except Exception as e: log.warning(f"on_finish: {e}")
     if body.get("stream"):
-        req = http.build_request("POST", LLAMA_URL, json=body)
         try:
+            req = http.build_request("POST", LLAMA_URL, json=body)
             upstream = await http.send(req, stream=True)
         except httpx.HTTPError as e:
-            return json_error(str(e), 502)
+            finish(); return json_error(str(e), 502)
         if upstream.status_code != 200:
             err_body = await upstream.aread()
             await upstream.aclose()
+            finish()
             return Response(content=err_body, status_code=upstream.status_code,
                             media_type=upstream.headers.get("content-type", "application/json"))
 
         async def relay():
-            acc, buf = [], b""
+            acc, buf, usage, timings = [], b"", None, None
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
-                    if on_complete is None: continue
+                    if on_complete is None and on_usage is None: continue
                     buf += chunk
                     while b"\n" in buf:
                         raw, buf = buf.split(b"\n", 1)
@@ -984,25 +1677,37 @@ async def forward(http: httpx.AsyncClient, body: dict, on_complete=None) -> Resp
                         if line.startswith("data:") and line != "data: [DONE]":
                             try:
                                 d = orjson.loads(line[5:].strip().encode())
-                                acc.append(d.get("choices", [{}])[0].get("delta", {}).get("content") or "")
+                                ch = d.get("choices") or [{}]
+                                acc.append((ch[0].get("delta") or {}).get("content") or "")
+                                u, t = _usage_of(d)
+                                usage, timings = u or usage, t or timings
                             except Exception: pass
             finally:
                 await upstream.aclose()
                 if on_complete is not None and "".join(acc):
                     on_complete("".join(acc))
+                if on_usage is not None and (usage or timings):
+                    on_usage(usage, timings)
+                finish()
 
-        return StreamingResponse(relay(), media_type="text/event-stream",
+        resp = StreamingResponse(relay(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        resp.owns_finish = on_finish is not None
+        return resp
 
     try:
         r = await http.post(LLAMA_URL, json=body)
     except httpx.HTTPError as e:
-        return json_error(str(e), 502)
-    if on_complete is not None and r.status_code == 200:
+        finish(); return json_error(str(e), 502)
+    if r.status_code == 200:
         try:
-            content = r.json()["choices"][0]["message"]["content"]
-            if isinstance(content, str) and content: on_complete(content)
+            j = r.json()
+            content = j["choices"][0]["message"]["content"]
+            if on_complete is not None and isinstance(content, str) and content: on_complete(content)
+            u, t = _usage_of(j)
+            if on_usage is not None and (u or t): on_usage(u, t)
         except Exception: pass
+    finish()
     return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
 
 def command_response(body: dict, text: str) -> Response:
@@ -1031,7 +1736,12 @@ def _ping():
 async def health():
     try:
         await asyncio.wait_for(db(_ping), timeout=5)
-        return {"status": True, "db": "ok", "version": VERSION}
+        hit = STATS["cached_tokens"] / STATS["prompt_tokens"] if STATS["prompt_tokens"] else None
+        return {"status": True, "db": "ok", "version": VERSION, "user_mode": USER_MODE, "context_mode": CONTEXT_MODE,
+                "context": {**STATS, "cache_hit": round(hit, 3) if hit is not None else None,
+                            "backends": {m: {"n_ctx": i.get("n_ctx"), "src": i.get("src"), "system_mode": i.get("system_mode")}
+                                         for m, i in BACKENDS.items()},
+                            "token_factor": {m: round(f, 3) for m, f in TOKENS.factor.items()}}}
     except Exception:
         return Response(content=orjson.dumps({"status": False, "version": VERSION}), status_code=503, media_type="application/json")
 
@@ -1049,6 +1759,16 @@ async def models(request: Request):
 async def chat(request: Request):
     key_user = check_auth(request)
     check_not_cross_site(request)
+    GATE.user_start()
+    try:
+        resp = await _chat(request, key_user)
+    except BaseException:
+        GATE.user_end(); raise
+    if not getattr(resp, "owns_finish", False):
+        GATE.user_end()
+    return resp
+
+async def _chat(request: Request, key_user):
     http: httpx.AsyncClient = request.app.state.http
     try:
         body = await request.json()
@@ -1061,24 +1781,28 @@ async def chat(request: Request):
     if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
         return json_error("messages must be an array of objects", 400)
     user_id = resolve_user(request, body, key_user)
-    chat_id = extract_chat_id(request, user_id, messages)
-
-    last_idx = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
-    last_user = messages[last_idx] if last_idx is not None else None
+    sys_msgs, non_sys = cx.split_system(messages)
+    lu = cx.last_user_index(non_sys)
+    last_user = non_sys[lu] if lu is not None else None
     user_content = last_user.get("content") if last_user else ""
-    user_text = user_content if isinstance(user_content, str) else ""
-    is_vision = user_content is not None and not isinstance(user_content, str)
+    raw_text = cx.content_text(user_content) if last_user else ""
+    is_vision = cx.has_media(user_content)
+    user_text = clean_client_text(raw_text) if raw_text else ""
 
-    if len(user_text) > MAX_INPUT_LEN:
+    if len(raw_text) > MAX_INPUT_LEN:
         return json_error("too long", 400)
 
-    # Служебные запросы Open WebUI (заголовки, теги, подсказки) — без памяти и без записи в БД
-    if is_service_request(user_text):
-        return await forward(http, body)
+    # Служебные запросы клиентов (заголовки, теги, подсказки) — без памяти и без записи в БД
+    if is_service_request(raw_text, body, len(non_sys)):
+        return await forward(http, body, on_finish=None)
+
+    hashes = cx.history_hashes(non_sys)
+    chat_id, last_is_new = await db(resolve_chat, user_id, header_chat_id(request), hashes,
+                                    legacy_chat_id(user_id, messages))
 
     # Слэш-команды (только точные). Не сохраняются: /forget не должен оставлять следов.
-    cmd_match = COMMAND_RE.match(user_text.strip()) if not is_vision else None
-    if cmd_match:
+    cmd_match = COMMAND_RE.match(raw_text.strip()) if (raw_text and not is_vision) else None
+    if cmd_match and last_user is non_sys[-1]:
         cmd = "/" + (cmd_match.group(1) or cmd_match.group(2)).lower()
         arg = (cmd_match.group(3) or "").strip()
         try:
@@ -1088,32 +1812,101 @@ async def chat(request: Request):
             resp_text = "❌ Ошибка выполнения команды, подробности в логе прокси."
         return command_response(body, resp_text)
 
-    await db(score_previous, user_id, chat_id, user_text)
+    new_question = last_is_new and last_user is not None and last_user is non_sys[-1]
+    if new_question and user_text:
+        await db(score_previous, user_id, chat_id, user_text)
 
-    pre_type = preclassify(user_text) if not is_vision else "unknown"
-    skip_memory = pre_type == "technical" or is_vision or not user_text
+    pre_type = preclassify(user_text) if user_text else "unknown"
+    skip_memory = pre_type == "technical" or not user_text
+    model = body.get("model") or ""
+    info = await backend_info(http, model)
+    plan = Plan(sys_msgs, non_sys, model, info, body)
+    first_user = next((cx.content_text(m.get("content")) for m in non_sys if m.get("role") == "user"), "")
+    memory_on = bool(first_user) and preclassify(clean_client_text(first_user)) != "technical"
 
-    if not skip_memory:
-        qv = await aembed_query(user_text[:2000])
-        block = await db(build_memory, user_id, chat_id, user_text, qv, pre_type)
-        if block:
-            messages = inject_memory(messages, last_idx, block)
-            body["messages"] = messages
+    async def qv():
+        return await aembed_query(user_text[:2000])
 
-    if total_tokens(messages) > COMPRESS_AT:
-        new_msgs = compress(messages)
-        if len(new_msgs) < len(messages):
-            body["messages"] = new_msgs
-            log.info(f"[Compress] {len(messages)} -> {len(new_msgs)}")
+    legacy_block = ""
+    if CONTEXT_MODE == "legacy" and not skip_memory:
+        legacy_block = await db(build_memory, user_id, chat_id, user_text, await qv(), pre_type)
 
-    if last_user and user_text:
+    async def build():
+        return await build_messages(request, http, plan, user_id, chat_id, memory_on,
+                                    None if skip_memory else (user_text, qv), legacy_block)
+
+    out, epoch = await build()
+    if out is None:
+        return command_response(body, epoch)
+    errs = cx.validate(out)
+    if errs:
+        STATS["invariant_fallback"] += 1
+        log.error(f"[Context] invariants violated {errs}: sending the original request")
+        out = messages
+    body["messages"] = out
+    if info.get("date_kw") and epoch and epoch.get("date_string"):
+        body["chat_template_kwargs"] = {"date_string": epoch["date_string"], **(body.get("chat_template_kwargs") or {})}
+
+    if new_question and user_text:
         try:
             msg_id = await db(save_user_message, user_id, chat_id, user_text, pre_type)
             if msg_id and pre_type != "technical":
-                schedule_cold(request.app, user_text, user_id, chat_id, msg_id, pre_type, http, body.get("model") or "")
+                schedule_cold(request.app, user_text, user_id, chat_id, msg_id, pre_type, http, model)
         except Exception as e: log.warning(f"Save user: {e}")
 
-    def on_complete(full: str):
-        db_submit(save_assistant_message, user_id, chat_id, full, pre_type)
+    est = {"n": TOKENS.messages(out, model) + TOKENS.tools(body.get("tools"), model)}
 
-    return await forward(http, body, on_complete)
+    def on_complete(full: str):
+        text = cx.strip_think(full)
+        if text: db_submit(save_assistant_message, user_id, chat_id, text, pre_type)
+
+    def on_usage(usage, timings):
+        u, t = usage or {}, timings or {}
+        prompt = u.get("prompt_tokens") or ((t.get("prompt_n") or 0) + (t.get("cache_n") or 0))
+        cached = ((u.get("prompt_tokens_details") or {}).get("cached_tokens") if isinstance(u.get("prompt_tokens_details"), dict) else None)
+        if cached is None: cached = t.get("cache_n") or 0
+        if isinstance(prompt, int) and prompt > 0:
+            STATS["requests"] += 1; STATS["prompt_tokens"] += prompt; STATS["cached_tokens"] += int(cached or 0)
+            TOKENS.observe(model, est["n"], prompt)
+
+    resp = await forward(http, body, on_complete, on_usage, on_finish=GATE.user_end)
+    if resp.status_code in (400, 413, 422) and learn_context_error(model, resp.status_code, getattr(resp, "body", b"") or b""):
+        STATS["ctx_retry"] += 1
+        GATE.user_start()
+        plan = Plan(sys_msgs, non_sys, model, BACKENDS.get(model, info), {**body, "messages": messages})
+        out, epoch = await build()
+        if out is None:
+            return command_response(body, epoch)
+        body["messages"] = out if not cx.validate(out) else messages
+        est["n"] = TOKENS.messages(body["messages"], model) + TOKENS.tools(body.get("tools"), model)
+        log.warning(f"[Context] retry after context overflow with budget ~{plan.B} tokens")
+        resp = await forward(http, body, on_complete, on_usage, on_finish=GATE.user_end)
+    resp.owns_finish = True
+    return resp
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def passthrough(path: str, request: Request):
+    """Остальные /v1/* (embeddings, completions…) — в бэкенд без изменений, с проверкой ключа."""
+    check_auth(request)
+    check_not_cross_site(request)
+    if not PASSTHROUGH:
+        return json_error("not found", 404)
+    http: httpx.AsyncClient = request.app.state.http
+    headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept")}
+    try:
+        req = http.build_request(request.method, f"{BACKEND_BASE}/v1/{path}", params=dict(request.query_params),
+                                 content=await request.body(), headers=headers)
+        up = await http.send(req, stream=True)
+    except httpx.HTTPError as e:
+        return json_error(str(e), 502)
+    ctype = up.headers.get("content-type", "application/json")
+    if "text/event-stream" in ctype:
+        async def relay():
+            try:
+                async for ch in up.aiter_bytes(): yield ch
+            finally:
+                await up.aclose()
+        return StreamingResponse(relay(), status_code=up.status_code, media_type=ctype)
+    data = await up.aread()
+    await up.aclose()
+    return Response(content=data, status_code=up.status_code, media_type=ctype)

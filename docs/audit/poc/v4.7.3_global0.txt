@@ -1,0 +1,7 @@
+=== v4.7.3  MODE=global0 ===
+[OPEN   ] H-1: GLOBAL_MEMORY=0: факт чата B инвалидирует факт чата A
+          [('userA-chat', 'Москва', 1795764733.072879), ('userB-chat', 'Казань', None)]
+[OPEN   ] H-1: GLOBAL_MEMORY=0: эмоции B видны в A
+          '[ДОЛГОВРЕМЕННАЯ ПАМЯТЬ]\nНегатив: понедельники\n[ПРИМЕРЫ ТВОЕГО СТИЛЯ]\nЭто развёрнутый ответ'
+[OPEN   ] H-1: GLOBAL_MEMORY=0: авто-Context Bridge подтягивает переписку B в A
+Сводка: {'FIXED': 0, 'PARTIAL': 0, 'OPEN': 3, 'NEW': 0}

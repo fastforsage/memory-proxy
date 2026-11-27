@@ -1,7 +1,18 @@
 """manage.py: stats / facts / export / reassign / purge / reindex на базе, созданной прокси."""
 import json, os, subprocess, sys
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+
+@pytest.fixture
+def make_ctx(make_ctx):
+    """Эти тесты проверяют многопользовательский режим v4.8 (USER_MODE=multi)."""
+    def _m(**env):
+        env.setdefault("USER_MODE", "multi")
+        return make_ctx(**env)
+    return _m
 
 
 def run(db_path, *args):

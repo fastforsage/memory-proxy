@@ -5,6 +5,7 @@
     python manage.py facts <user>              # актуальные факты пользователя
     python manage.py export <user> [file]      # всё о пользователе в JSON (stdout или файл)
     python manage.py reassign <from> <to>      # перенести данные (например, 'default' → id из Open WebUI)
+    python manage.py merge --into <owner>      # слить данные всех пользователей в одного (USER_MODE=single)
     python manage.py purge <user> --yes        # удалить всё о пользователе
     python manage.py reindex                   # пересчитать все векторы при следующем старте
 
@@ -20,6 +21,13 @@ import time
 
 DB_PATH = os.getenv("DB_PATH", "/data/memory.db")
 USER_TABLES = ("messages", "facts", "emotions", "style_examples")
+CONTEXT_TABLES = ("chat_chain", "chat_epochs", "pinned_deltas")      # v5: состояние окон чатов
+# Должно совпадать с proxy.SINGLE_VALUED (manage.py не импортирует proxy, чтобы не грузить модель)
+SINGLE_VALUED = {"works_at", "lives_in", "age", "birthday", "partner_name", "current_project"}
+
+
+def _tables(c, names):
+    return [t for t in names if c.execute("SELECT 1 FROM sqlite_master WHERE name=?", (t,)).fetchone()]
 
 
 def connect():
@@ -111,7 +119,7 @@ def cmd_reassign(c, src, dst):
     with c:
         moved_ids = [r[0] for r in c.execute("SELECT id FROM facts WHERE user_id=?", (src,))]
         n = {}
-        for t in USER_TABLES:
+        for t in USER_TABLES + tuple(_tables(c, CONTEXT_TABLES)):
             # Конфликты уникальности (у получателя уже есть такой факт/эмоция) — оставляем запись получателя
             n[t] = c.execute(f"UPDATE OR IGNORE {t} SET user_id=? WHERE user_id=?", (dst, src)).rowcount
             c.execute(f"DELETE FROM {t} WHERE user_id=?", (src,))
@@ -129,7 +137,63 @@ def cmd_purge(c, user, confirm):
         if _has_vec(c):
             c.execute("DELETE FROM vec_facts WHERE rowid IN (SELECT id FROM facts WHERE user_id=?)", (user,))
         n = {t: c.execute(f"DELETE FROM {t} WHERE user_id=?", (user,)).rowcount for t in USER_TABLES}
+        for t in _tables(c, CONTEXT_TABLES):
+            c.execute(f"DELETE FROM {t} WHERE user_id=?", (user,))
     print(f"🗑 {user}: " + ", ".join(f"{t} {k}" for t, k in n.items()))
+
+
+def cmd_merge(c, flag, owner):
+    """Все пользователи → owner. Конфликт однозначных фактов («живёт в …») решается по свежести:
+    актуален последний valid_from, остальные закрываются (история сохраняется). Перед слиянием — резервная копия."""
+    if flag != "--into" or not owner:
+        sys.exit("Использование: manage.py merge --into <owner>")
+    others = [r[0] for r in c.execute(
+        "SELECT user_id FROM (SELECT DISTINCT user_id FROM messages UNION SELECT DISTINCT user_id FROM facts "
+        "UNION SELECT DISTINCT user_id FROM emotions UNION SELECT DISTINCT user_id FROM style_examples) "
+        "WHERE user_id != ? ORDER BY user_id", (owner,))]
+    if not others:
+        print(f"Сливать нечего: все данные уже у '{owner}'."); return
+    bak = f"{DB_PATH}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    dst = sqlite3.connect(bak)
+    c.backup(dst)
+    dst.close()
+    vec = _has_vec(c)
+    total = {}
+    with c:
+        for src in others:
+            moved = [r[0] for r in c.execute("SELECT id FROM facts WHERE user_id=?", (src,))]
+            for scope, trig, score, cnt, ls, q in c.execute(
+                    "SELECT scope, trigger, score, mention_count, last_seen, last_quote FROM emotions WHERE user_id=?", (src,)).fetchall():
+                row = c.execute("SELECT score, mention_count, last_seen FROM emotions WHERE user_id=? AND scope=? AND trigger=?",
+                                (owner, scope, trig)).fetchone()
+                if row:
+                    c.execute("UPDATE emotions SET score=?, mention_count=?, last_seen=?, last_quote=COALESCE(?, last_quote) "
+                              "WHERE user_id=? AND scope=? AND trigger=?",
+                              ((row[0] or 0) + (score or 0), (row[1] or 0) + (cnt or 0), max(row[2] or 0, ls or 0),
+                               q if (ls or 0) > (row[2] or 0) else None, owner, scope, trig))
+                    c.execute("DELETE FROM emotions WHERE user_id=? AND scope=? AND trigger=?", (src, scope, trig))
+            for t in USER_TABLES + tuple(_tables(c, CONTEXT_TABLES)):
+                total[t] = total.get(t, 0) + c.execute(f"UPDATE OR IGNORE {t} SET user_id=? WHERE user_id=?", (owner, src)).rowcount
+                c.execute(f"DELETE FROM {t} WHERE user_id=?", (src,))
+            if vec and moved:
+                ph = ",".join("?" * len(moved))
+                c.execute(f"DELETE FROM vec_facts WHERE rowid IN ({ph})", moved)
+        closed = 0
+        for scope, pred in c.execute(
+                f"SELECT scope, predicate FROM facts WHERE user_id=? AND valid_to IS NULL AND predicate IN "
+                f"({','.join('?' * len(SINGLE_VALUED))}) GROUP BY scope, predicate HAVING COUNT(*) > 1",
+                (owner, *sorted(SINGLE_VALUED))).fetchall():
+            rows = c.execute("SELECT id, valid_from FROM facts WHERE user_id=? AND scope=? AND predicate=? AND valid_to IS NULL "
+                             "ORDER BY valid_from DESC, id DESC", (owner, scope, pred)).fetchall()
+            newest_from = rows[0][1]
+            for fid, _ in rows[1:]:
+                c.execute("UPDATE facts SET valid_to=? WHERE id=?", (newest_from, fid))
+                if vec: c.execute("DELETE FROM vec_facts WHERE rowid=?", (fid,))
+                closed += 1
+    print(f"✅ {', '.join(others)} → {owner}: " + ", ".join(f"{t} {k}" for t, k in total.items() if k) +
+          (f"; закрыто устаревших фактов: {closed}" if closed else ""))
+    print(f"Резервная копия: {bak}")
+    print("Перезапустите прокси, чтобы пересчитать векторы перенесённых фактов.")
 
 
 def cmd_reindex(c):
@@ -146,7 +210,7 @@ def main(argv):
     cmd, args = argv[1], argv[2:]
     table = {"stats": (cmd_stats, 0, 0), "users": (cmd_stats, 0, 0), "facts": (cmd_facts, 1, 1),
              "export": (cmd_export, 1, 2), "reassign": (cmd_reassign, 2, 2), "purge": (cmd_purge, 1, 2),
-             "reindex": (cmd_reindex, 0, 0)}
+             "reindex": (cmd_reindex, 0, 0), "merge": (cmd_merge, 2, 2)}
     if cmd not in table:
         print(__doc__); return 2
     fn, lo, hi = table[cmd]

@@ -1,0 +1,298 @@
+{
+ "rows": [
+  {
+   "turn": 0,
+   "prompt_n": 59,
+   "cache_n": 3,
+   "sec": 0.88,
+   "bg_wait": 2.5,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "ОК."
+  },
+  {
+   "turn": 1,
+   "prompt_n": 306,
+   "cache_n": 65,
+   "sec": 1.96,
+   "bg_wait": 5.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 2,
+   "prompt_n": 291,
+   "cache_n": 372,
+   "sec": 1.89,
+   "bg_wait": 5.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 3,
+   "prompt_n": 276,
+   "cache_n": 664,
+   "sec": 1.93,
+   "bg_wait": 5.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 4,
+   "prompt_n": 276,
+   "cache_n": 941,
+   "sec": 1.97,
+   "bg_wait": 5.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 5,
+   "prompt_n": 306,
+   "cache_n": 1218,
+   "sec": 2.37,
+   "bg_wait": 0.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 6,
+   "prompt_n": 306,
+   "cache_n": 1525,
+   "sec": 4.15,
+   "bg_wait": 0.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 7,
+   "prompt_n": 291,
+   "cache_n": 1832,
+   "sec": 3.33,
+   "bg_wait": 0.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 8,
+   "prompt_n": 291,
+   "cache_n": 2124,
+   "sec": 3.37,
+   "bg_wait": 0.0,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 9,
+   "prompt_n": 276,
+   "cache_n": 2416,
+   "sec": 3.36,
+   "bg_wait": 68.2,
+   "switch": 0,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 0,
+   "answer": "0"
+  },
+  {
+   "turn": 10,
+   "prompt_n": 847,
+   "cache_n": 1393,
+   "sec": 6.32,
+   "bg_wait": 24.1,
+   "switch": 1,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 1,
+   "answer": "0"
+  },
+  {
+   "turn": 11,
+   "prompt_n": 278,
+   "cache_n": 1333,
+   "sec": 2.12,
+   "bg_wait": 0.0,
+   "switch": 2,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 2,
+   "answer": "0"
+  },
+  {
+   "turn": 12,
+   "prompt_n": 277,
+   "cache_n": 1612,
+   "sec": 3.8,
+   "bg_wait": 8.0,
+   "switch": 2,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 2,
+   "answer": "0"
+  },
+  {
+   "turn": 13,
+   "prompt_n": 307,
+   "cache_n": 1890,
+   "sec": 2.67,
+   "bg_wait": 0.0,
+   "switch": 2,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 2,
+   "answer": "0"
+  },
+  {
+   "turn": 14,
+   "prompt_n": 292,
+   "cache_n": 2198,
+   "sec": 12.66,
+   "bg_wait": 0.0,
+   "switch": 2,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 2,
+   "answer": "0"
+  },
+  {
+   "turn": 15,
+   "prompt_n": 307,
+   "cache_n": 2491,
+   "sec": 4.62,
+   "bg_wait": 51.2,
+   "switch": 2,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 2,
+   "answer": "0"
+  },
+  {
+   "turn": 16,
+   "prompt_n": 879,
+   "cache_n": 1245,
+   "sec": 6.75,
+   "bg_wait": 5.0,
+   "switch": 3,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 3,
+   "answer": "0"
+  },
+  {
+   "turn": 17,
+   "prompt_n": 292,
+   "cache_n": 2125,
+   "sec": 2.77,
+   "bg_wait": 57.7,
+   "switch": 3,
+   "sync": 0,
+   "summaries": 0,
+   "warmup": 3,
+   "answer": "0"
+  },
+  {
+   "turn": 18,
+   "prompt_n": 308,
+   "cache_n": 1141,
+   "sec": 2.18,
+   "bg_wait": 20.6,
+   "switch": 4,
+   "sync": 0,
+   "summaries": 1,
+   "warmup": 4,
+   "answer": "0"
+  },
+  {
+   "turn": 19,
+   "prompt_n": 292,
+   "cache_n": 1450,
+   "sec": 2.2,
+   "bg_wait": 5.0,
+   "switch": 4,
+   "sync": 0,
+   "summaries": 1,
+   "warmup": 4,
+   "answer": "0"
+  },
+  {
+   "turn": 20,
+   "prompt_n": 307,
+   "cache_n": 1743,
+   "sec": 2.41,
+   "bg_wait": 20.6,
+   "switch": 4,
+   "sync": 0,
+   "summaries": 1,
+   "warmup": 4,
+   "answer": "0"
+  },
+  {
+   "turn": 21,
+   "prompt_n": 96,
+   "cache_n": 2051,
+   "sec": 2.58,
+   "bg_wait": 47.7,
+   "switch": 4,
+   "sync": 0,
+   "summaries": 1,
+   "warmup": 4,
+   "answer": "- пользователь: «Запомни: ключ от гаража лежит в синей банке"
+  }
+ ],
+ "health": {
+  "status": true,
+  "db": "ok",
+  "version": "5.0.0",
+  "user_mode": "single",
+  "context_mode": "v5",
+  "context": {
+   "requests": 22,
+   "prompt_tokens": 38992,
+   "cached_tokens": 31832,
+   "epoch_switch": 4,
+   "epoch_sync": 0,
+   "oversize": 0,
+   "ctx_retry": 0,
+   "invariant_fallback": 0,
+   "warmup": 5,
+   "summaries": 2,
+   "cache_hit": 0.816,
+   "backends": {
+    "qwen": {
+     "n_ctx": 8192,
+     "src": "llama.cpp /props",
+     "system_mode": "native"
+    }
+   },
+   "token_factor": {
+    "qwen": 1.002
+   }
+  }
+ }
+}

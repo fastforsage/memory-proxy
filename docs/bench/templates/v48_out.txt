@@ -1,0 +1,33 @@
+Apertus-8B-Instruct                          ERR Invalid message role
+ByteDance-Seed-OSS                           ok
+CohereForAI-c4ai-command-r7b-12-2024-tool_us ok
+GLM-4.6                                      ok
+GLM-4.7-Flash                                ok
+GigaChat3.1-10B-A1.8B                        ok
+HuggingFaceTB-SmolLM3-3B                     ok
+Kimi-K2-Thinking                             ok
+LFM2.5-Instruct                              ok
+MiniMax-M2                                   ok
+Mistral-Small-3.2-24B-Instruct-2506          ERR After the optional system message, conversation roles must alternate u
+NVIDIA-Nemotron-3-Nano-30B-A3B-BF16          ok
+NousResearch-Hermes-3-Llama-3.1-8B-tool_use  ok
+Qwen-QwQ-32B                                 ok
+Qwen-Qwen2.5-7B-Instruct                     ok
+Qwen-Qwen3-0.6B                              ok
+Qwen3-Coder                                  ok
+Qwen3.5-4B                                   ERR System message must be at the beginning.
+deepseek-ai-DeepSeek-R1-Distill-Qwen-32B     ok
+deepseek-ai-DeepSeek-V3.1                    ok
+deepseek-ai-DeepSeek-V3.2                    ok
+google-gemma-2-2b-it                         ERR System role not supported
+google-gemma-4-31B-it                        ok
+ibm-granite-granite-4.0                      ok
+meta-llama-Llama-3.1-8B-Instruct             ok
+meta-llama-Llama-3.2-3B-Instruct             ok
+meta-llama-Llama-3.3-70B-Instruct            ok
+microsoft-Phi-3.5-mini-instruct              ok
+mistralai-Ministral-3-14B-Reasoning-2512     ERR Only user, assistant and tool roles are supported, got system.
+mistralai-Mistral-Nemo-Instruct-2407         ERR After the optional system message, conversation roles must alternate u
+moonshotai-Kimi-K2                           ok
+openai-gpt-oss-120b                          ok
+6 ['Apertus-8B-Instruct', 'Mistral-Small-3.2-24B-Instruct-2506', 'Qwen3.5-4B', 'google-gemma-2-2b-it', 'mistralai-Ministral-3-14B-Reasoning-2512', 'mistralai-Mistral-Nemo-Instruct-2407']

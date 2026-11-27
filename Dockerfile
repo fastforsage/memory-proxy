@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY download_model.py .
 RUN python download_model.py
-COPY --chown=app:app proxy.py manage.py ./
+COPY --chown=app:app proxy.py context.py manage.py ./
 RUN mkdir -p /data && chown app:app /data
 USER app
 EXPOSE 8081

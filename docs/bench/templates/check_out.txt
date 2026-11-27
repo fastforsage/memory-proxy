@@ -1,0 +1,67 @@
+Apertus-8B-Instruct                        chat=ok | step=ok | turn=BREAK 19 «'<|assistant_start|>'» | date=ok | nosys=ok | sys=ok | uu=ok
+ByteDance-Seed-OSS                         chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+CohereForAI-c4ai-command-r7b-12-2024-tool_ chat=BREAK 26 «'THINKING|><|END_THINKING|>'» | step=ok | turn=BREAK 26 «'THINKING|><|END_THINKING|>'» | date=ok | nosys=ok | sys=ok | uu=ok
+GLM-4.6                                    chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+GLM-4.7-Flash                              chat=BREAK 6 «'think>'» | step=BREAK 6 «'think>'» | turn=BREAK 6 «'think>'» | date=ok | nosys=ok | sys=ok | uu=ok
+GigaChat3.1-10B-A1.8B                      chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+HuggingFaceTB-SmolLM3-3B                   chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+Kimi-K2-Thinking                           chat=ok | step=ERR access to attribute 'append' of 'list' object is u | turn=ERR access to attribute 'append' of 'list' object is u | date=ok | nosys=ok | sys=ok | uu=ok
+LFM2.5-Instruct                            chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+MiniMax-M2                                 chat=BREAK 8 «'<think>\n'» | step=BREAK 8 «'<think>\n'» | turn=BREAK 8 «'<think>\n'» | date=ok | nosys=ok | sys=ok | uu=ok
+Mistral-Small-3.2-24B-Instruct-2506        chat=ok | step=ok | turn=BREAK 397 «'AVAILABLE_TOOLS][{"type": "function", "function": {"name": "'» | date=ok | nosys=ok | sys=ok | uu=ERR After the optional system message, c
+NVIDIA-Nemotron-3-Nano-30B-A3B-BF16        chat=BREAK 1 «'\n'» | step=BREAK 1 «'\n'» | turn=BREAK 1 «'\n'» | date=ok | nosys=ok | sys=ok | uu=ok
+NousResearch-Hermes-3-Llama-3.1-8B-tool_us chat=ok | step=ok | turn=BREAK 32 «'<|im_end|><|im_start|>assistant\n'» | date=ok | nosys=ok | sys=ok | uu=ok
+Qwen-QwQ-32B                               chat=BREAK 16 «'<think>\n</think>'» | step=BREAK 14 «'hink>\n</think>'» | turn=BREAK 16 «'<think>\n</think>'» | date=ok | nosys=ok | sys=ok | uu=ok
+Qwen-Qwen2.5-7B-Instruct                   chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+Qwen-Qwen3-0.6B                            chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+Qwen3-Coder                                chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+Qwen3.5-4B                                 chat=BREAK 8 «'<think>\n'» | step=ok | turn=BREAK 224 «'hink>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<paramet'» | date=ok | nosys=ok | sys=ok | uu=ok
+deepseek-ai-DeepSeek-R1-Distill-Qwen-32B   chat=BREAK 16 «'<think>\n</think>'» | step=BREAK 15 «'think>\n</think>'» | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+deepseek-ai-DeepSeek-V3.1                  chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+deepseek-ai-DeepSeek-V3.2                  chat=BREAK 14 «'think></think>'» | step=BREAK 14 «'think></think>'» | turn=BREAK 14 «'think></think>'» | date=ok | nosys=ok | sys=ok | uu=ok
+google-gemma-2-2b-it                       chat=ERR System role not supported | step=ERR System role not supported | turn=ERR System role not supported | date=ERR System role not supported | nosys=ok | sys=ERR System role not supported | uu=ERR System role not supported
+google-gemma-4-31B-it                      chat=BREAK 28 «'<|channel>thought\n<channel|>'» | step=BREAK 26 «'channel>thought\n<channel|>'» | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+ibm-granite-granite-4.0                    chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+meta-llama-Llama-3.1-8B-Instruct           chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+meta-llama-Llama-3.2-3B-Instruct           chat=ok | step=ok | turn=ok | date=BREAK 349 «'6 Nov 2026\n\nТы помощник.<|eot_id|><|start_header_id|>user<|e'» | nosys=ok | sys=ok | uu=ok
+meta-llama-Llama-3.3-70B-Instruct          chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+microsoft-Phi-3.5-mini-instruct            chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+mistralai-Ministral-3-14B-Reasoning-2512   chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ERR After the optional system message, c
+mistralai-Mistral-Nemo-Instruct-2407       chat=BREAK 57 «'Ты помощник.\n\nВопрос 2: расскажи про тему номер 2.[/INST]'» | step=BREAK 57 «'Ты помощник.\n\nВопрос 2: расскажи про тему номер 2.[/INST]'» | turn=BREAK 435 «'AVAILABLE_TOOLS][{"type": "function", "function": {"name": "'» | date=ok | nosys=ok | sys=ok | uu=ERR After the optional system message, c
+moonshotai-Kimi-K2                         chat=ok | step=ok | turn=ok | date=ok | nosys=ok | sys=ok | uu=ok
+openai-gpt-oss-120b                        chat=ok | step=ok | turn=ok | date=BREAK 424 «'6\n\nReasoning: medium\n\n# Valid channels: analysis, commentary'» | nosys=ok | sys=ok | uu=ok
+
+=== classification ===
+Apertus-8B-Instruct                          gen=19 chat=ok tool_step=ok tool_next_turn=tail date=ok sys=ok uu=ok
+ByteDance-Seed-OSS                           gen=20 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+CohereForAI-c4ai-command-r7b-12-2024-tool_us gen=0 chat=BREAK26 tool_step=ok tool_next_turn=BREAK26 date=ok sys=ok uu=ok
+GLM-4.6                                      gen=13 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+GLM-4.7-Flash                                gen=20 chat=tail tool_step=tail tool_next_turn=tail date=ok sys=ok uu=ok
+GigaChat3.1-10B-A1.8B                        gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+HuggingFaceTB-SmolLM3-3B                     gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+Kimi-K2-Thinking                             gen=38 chat=ok tool_step=err tool_next_turn=err date=ok sys=ok uu=ok
+LFM2.5-Instruct                              gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+MiniMax-M2                                   gen=15 chat=tail tool_step=tail tool_next_turn=tail date=ok sys=ok uu=ok
+Mistral-Small-3.2-24B-Instruct-2506          gen=0 chat=ok tool_step=ok tool_next_turn=BREAK397 date=ok sys=ok uu=ERR
+NVIDIA-Nemotron-3-Nano-30B-A3B-BF16          gen=30 chat=tail tool_step=tail tool_next_turn=tail date=ok sys=ok uu=ok
+NousResearch-Hermes-3-Llama-3.1-8B-tool_use  gen=22 chat=ok tool_step=ok tool_next_turn=BREAK32 date=ok sys=ok uu=ok
+Qwen-QwQ-32B                                 gen=38 chat=tail tool_step=tail tool_next_turn=tail date=ok sys=ok uu=ok
+Qwen-Qwen2.5-7B-Instruct                     gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+Qwen-Qwen3-0.6B                              gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+Qwen3-Coder                                  gen=22 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+Qwen3.5-4B                                   gen=30 chat=tail tool_step=ok tool_next_turn=BREAK224 date=ok sys=ok uu=ok
+deepseek-ai-DeepSeek-R1-Distill-Qwen-32B     gen=29 chat=tail tool_step=tail tool_next_turn=ok date=ok sys=ok uu=ok
+deepseek-ai-DeepSeek-V3.1                    gen=28 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+deepseek-ai-DeepSeek-V3.2                    gen=28 chat=tail tool_step=tail tool_next_turn=tail date=ok sys=ok uu=ok
+google-gemma-2-2b-it                         gen=None chat=err tool_step=err tool_next_turn=err date=err sys=ERR uu=ERR
+google-gemma-4-31B-it                        gen=41 chat=tail tool_step=tail tool_next_turn=ok date=ok sys=ok uu=ok
+ibm-granite-granite-4.0                      gen=41 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+meta-llama-Llama-3.1-8B-Instruct             gen=47 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+meta-llama-Llama-3.2-3B-Instruct             gen=47 chat=ok tool_step=ok tool_next_turn=ok date=BREAK349 sys=ok uu=ok
+meta-llama-Llama-3.3-70B-Instruct            gen=47 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+microsoft-Phi-3.5-mini-instruct              gen=10 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+mistralai-Ministral-3-14B-Reasoning-2512     gen=0 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ERR
+mistralai-Mistral-Nemo-Instruct-2407         gen=0 chat=BREAK57 tool_step=BREAK57 tool_next_turn=BREAK435 date=ok sys=ok uu=ERR
+moonshotai-Kimi-K2                           gen=38 chat=ok tool_step=ok tool_next_turn=ok date=ok sys=ok uu=ok
+openai-gpt-oss-120b                          gen=18 chat=ok tool_step=ok tool_next_turn=ok date=BREAK424 sys=ok uu=ok
+{'chat': {'ok': 21, 'break': 2, 'tail': 8, 'err': 1}, 'tool_step': {'ok': 22, 'tail': 7, 'err': 2, 'break': 1}, 'tool_next_turn': {'tail': 6, 'ok': 19, 'break': 5, 'err': 2}, 'date': {'ok': 29, 'err': 1, 'break': 2}}

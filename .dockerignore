@@ -3,6 +3,7 @@ data/
 *.db-wal
 *.db-shm
 *.db.backup.*
+*.db.bak-*
 *.db.before_*
 *.db.cleanup_*
 __pycache__/
@@ -17,3 +18,4 @@ tests/
 .github/
 .pytest_cache/
 model/
+docs/

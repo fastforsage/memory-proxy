@@ -88,6 +88,12 @@ class FakeLLM:
 
     def __init__(self):
         self.requests, self.cold_replies = [], []
+        self.props = None              # dict → ответ GET /props (llama.cpp), None → 404
+        self.templates = None          # callable(messages) → prompt для /apply-template, None → 404
+        self.ctx_limit = None          # int → 400 exceed_context_size_error, если промпт длиннее (оценка len/3)
+        self.summary_reply = "- краткое содержание: пользователь обсуждал проект"
+        self.other = []                # прочие запросы (passthrough, props)
+        self.usage = None              # dict → поле usage в ответе (монитор кэша)
 
     def cold(self, facts=None, emotions=None, type_="personal", raw=None):
         self.cold_replies.append(raw if raw is not None else
@@ -95,7 +101,16 @@ class FakeLLM:
 
     @property
     def chat_requests(self):
-        return [r for r in self.requests if not r.get("response_format")]
+        return [r for r in self.requests if not r.get("response_format") and not r.get("_rejected")
+                and r.get("max_tokens") not in (1, 700)]
+
+    @property
+    def summary_requests(self):
+        return [r for r in self.requests if r.get("max_tokens") == 700]
+
+    @property
+    def warmup_requests(self):
+        return [r for r in self.requests if r.get("max_tokens") == 1]
 
     @property
     def cold_requests(self):
@@ -103,10 +118,32 @@ class FakeLLM:
 
     def handler(self, request):
         import httpx
-        if request.url.path.endswith("/models"):
+        path = request.url.path
+        if path.endswith("/models"):
             return httpx.Response(200, json={"object": "list", "data": [{"id": "test-model"}]})
+        if path.endswith("/props"):
+            self.other.append(path)
+            return httpx.Response(200, json=self.props) if self.props is not None else httpx.Response(404)
+        if path.endswith("/apply-template"):
+            if self.templates is None: return httpx.Response(404)
+            try:
+                return httpx.Response(200, json={"prompt": self.templates(json.loads(request.content)["messages"])})
+            except Exception as e:
+                return httpx.Response(500, json={"error": {"message": str(e)}})
+        if not path.endswith("/chat/completions"):
+            self.other.append((request.method, path, request.content))
+            return httpx.Response(200, json={"object": "list", "data": [{"embedding": [0.1, 0.2]}], "path": path})
         body = json.loads(request.content or b"{}")
+        if self.ctx_limit and not body.get("response_format"):
+            n = sum(len(json.dumps(m.get("content"), ensure_ascii=False)) for m in body.get("messages", [])) // 3
+            if n > self.ctx_limit:
+                self.requests.append({**body, "_rejected": True})
+                return httpx.Response(400, json={"error": {"code": 400, "type": "exceed_context_size_error",
+                                                           "message": "request exceeds the available context size",
+                                                           "n_prompt_tokens": n, "n_ctx": self.ctx_limit}})
         self.requests.append(body)
+        if body.get("max_tokens") == 700 and "краткое содержание" in json.dumps(body, ensure_ascii=False):
+            return httpx.Response(200, json={"choices": [{"message": {"content": self.summary_reply}}]})
         if body.get("response_format", {}).get("type") == "json_object":
             content = self.cold_replies.pop(0) if self.cold_replies else '{"type":"personal","facts":[],"emotions":[]}'
             return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
@@ -115,7 +152,9 @@ class FakeLLM:
             chunks = [json.dumps({"choices": [{"delta": {"content": p}}]}) for p in (self.ANSWER[:half], self.ANSWER[half:])]
             sse = "".join(f"data: {c}\n\n" for c in chunks) + "data: [DONE]\n\n"
             return httpx.Response(200, content=sse.encode(), headers={"content-type": "text/event-stream"})
-        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": self.ANSWER}}]})
+        resp = {"choices": [{"message": {"role": "assistant", "content": self.ANSWER}}]}
+        if self.usage: resp["usage"] = self.usage
+        return httpx.Response(200, json=resp)
 
 
 class Ctx:
@@ -126,7 +165,7 @@ class Ctx:
         h = {"X-OpenWebUI-Chat-Id": chat_id} if chat_id else {}
         if user:
             h["X-OpenWebUI-User-Id"] = user
-        if self.proxy.API_KEY:
+        if self.proxy.API_KEY and "Authorization" not in (headers or {}):
             h["Authorization"] = f"Bearer {self.proxy.API_KEY}"
         h.update(headers or {})
         msgs = list(history or []) + [{"role": "user", "content": text}]
@@ -136,7 +175,7 @@ class Ctx:
     def drain(self, timeout=5.0):
         end = time.time() + timeout
         while time.time() < end:
-            if not self.proxy.app.state.tasks:
+            if not self.proxy.app.state.tasks and not self.proxy.app.state.bg:
                 self.proxy._DB.submit(lambda: None).result(timeout=timeout)   # дождаться записей в потоке БД
                 return
             time.sleep(0.02)
@@ -153,9 +192,11 @@ class Ctx:
         return [m for m in self.llm.chat_requests[idx]["messages"] if m["role"] == "user"][-1]["content"]
 
     def memory_text(self, idx=-1):
-        """Содержимое блока <memory> в последнем user-сообщении, отправленном в LLM ('' если блока нет)."""
+        """Содержимое всех блоков <memory> в последнем user-сообщении, отправленном в LLM ('' если блоков нет)."""
         t = self.last_user_text(idx)
-        return t.split("<memory>", 1)[1].split("</memory>", 1)[0] if t.startswith("<memory>") else ""
+        if isinstance(t, list):
+            t = "\n".join(p.get("text", "") for p in t if p.get("type") == "text")
+        return "\n".join(re.findall(r"<memory>\n(.*?)\n</memory>", t, re.S))
 
 
 @pytest.fixture

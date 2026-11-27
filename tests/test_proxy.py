@@ -13,15 +13,6 @@ def test_safe_float():
     assert sf("abc") == 0.0 and sf(None) == 0.0
 
 
-def test_rough_tokens():
-    rt = P().rough_tokens
-    assert rt("") == 0 and rt("a" * 300) == 100 and rt(None) == 1
-
-
-def test_total_tokens_vision():
-    assert P().total_tokens([{"role": "user", "content": [{"type": "image_url"}]}]) < 100
-
-
 PERSONAL = {
     "story_ru": "Вчера мы с женой ездили на дачу к её родителям, жарили шашлык, потом долго гуляли у реки и обсуждали, куда поехать летом. Я давно мечтаю о Байкале, а она хочет на море.",
     "emotional_ru": "Привет!!! Сегодня отличный день :) Сходили с Машей в кино — было супер! Завтра в 10:30 идём к врачу (наконец-то). Кто-то из друзей тоже придёт!",
@@ -91,35 +82,16 @@ def test_classify_feedback(text, delta):
 def test_is_service_request():
     s = P().is_service_request
     assert s("### Task: generate tags") is True and s("hello") is False
+    # LibreChat-подобный заголовок и эвристика «без истории + малый max_tokens»
+    assert s("Please provide a 5-word-or-less title for the conversation") is True
+    assert s("Write a title for this chat", {"max_tokens": 32}, 1) is True
+    assert s("Придумай заголовок статьи", {"max_tokens": 32}, 1) is False     # русский — это просьба пользователя
+    assert s("Write a title for this chat", {"max_tokens": 2000}, 1) is False
 
 
-def test_keep_recent_validation():
-    assert P().KEEP_RECENT >= 1
-
-
-def test_compress_no_op_short():
-    p = P()
-    msgs = [{"role": "user", "content": "a"}] * (p.KEEP_RECENT + 1)
-    assert p.compress(msgs) == msgs
-
-
-def test_compress_keeps_system():
-    p = P()
-    msgs = [{"role": "system", "content": "sys"}] + [{"role": "user", "content": f"m{i}"} for i in range(p.KEEP_RECENT + 5)]
-    result = p.compress(msgs)
-    assert result[0]["role"] == "system" and len(result) == 2 + p.KEEP_RECENT
-
-
-def test_compress_does_not_orphan_tool_messages():
-    p = P()
-    msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-    msgs += [{"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
-             {"role": "tool", "tool_call_id": "1", "content": "r1"},
-             {"role": "tool", "tool_call_id": "1", "content": "r2"}]
-    msgs += [{"role": "user", "content": f"n{i}"} for i in range(p.KEEP_RECENT - 2)]
-    recent = [m for m in p.compress(msgs) if m["role"] != "system"]
-    assert recent[0]["role"] != "tool"
-    assert any(m.get("tool_calls") for m in recent)
+def test_clean_client_text():
+    t = "<task>\nПочини тесты\n</task>\n<environment_details>cwd: /x\nfiles: a.py</environment_details>"
+    assert P().clean_client_text(t) == "Почини тесты"
 
 
 def test_stems():
