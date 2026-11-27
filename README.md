@@ -1,4 +1,3 @@
-```markdown
 # 🧠 memory-proxy
 
 **Local-first memory layer for OpenAI-compatible clients (Open WebUI, SillyTavern, LibreChat) → local LLM (llama.cpp, Ollama, vLLM).**
