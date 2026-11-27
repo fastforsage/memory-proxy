@@ -12,3 +12,8 @@ __pycache__/
 .idea/
 *.md
 tests/
+*.log
+.env
+.github/
+.pytest_cache/
+model/

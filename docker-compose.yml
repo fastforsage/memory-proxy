@@ -1,6 +1,6 @@
 services:
   memory-proxy:
-    image: fastforsage/memory-proxy:v4.7.3
+    image: fastforsage/memory-proxy:v4.8.0
     container_name: memory-proxy
     ports:
       - "127.0.0.1:8081:8081"
@@ -10,10 +10,21 @@ services:
       - COMPRESS_AT=16000
       - KEEP_RECENT=8
       - API_KEY=${MEMORY_PROXY_API_KEY:-}
+      # Персональные ключи "user:key,user2:key2": ключ определяет пользователя (необязательно)
+      - API_KEYS=${MEMORY_PROXY_API_KEYS:-}
+      # Доверять X-OpenWebUI-User-Id / полю user (1) или считать всех одним пользователем (0)
+      - TRUST_USER_HEADER=${TRUST_USER_HEADER:-1}
+      # Кому отдать данные, сохранённые до v4.8 (по умолчанию 'default')
+      - LEGACY_USER_ID=${LEGACY_USER_ID:-}
+      # Хранить сообщения N дней (0 — бессрочно). Факты не удаляются
+      - RETENTION_DAYS=${RETENTION_DAYS:-0}
       - CORS_ORIGINS=${MEMORY_PROXY_CORS_ORIGINS:-}
+      # Имена, по которым к прокси обращаются клиенты (защита от DNS rebinding). '*' отключает проверку.
+      - ALLOWED_HOSTS=${MEMORY_PROXY_ALLOWED_HOSTS:-localhost,127.0.0.1,host.docker.internal,memory-proxy}
       - GLOBAL_MEMORY=${GLOBAL_MEMORY:-1}
       - EXTRACT_URL=${EXTRACT_URL:-}
       - EXTRACT_MODEL=${EXTRACT_MODEL:-}
+      - MAX_PENDING_COLD=${MAX_PENDING_COLD:-32}
       - LOG_LEVEL=INFO
     volumes:
       - ./data:/data
