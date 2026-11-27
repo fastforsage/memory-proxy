@@ -1,5 +1,7 @@
 # Стабильность префикса на шаблонах чата
 
+**Русский** | [English](../../en/bench/templates/README.md)
+
 Шаблоны — из [`llama.cpp/models/templates`](https://github.com/ggml-org/llama.cpp/tree/master/models/templates) (32 файла `.jinja`). Скрипты запускаются в каталоге с шаблонами:
 
 ```bash

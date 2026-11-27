@@ -1,5 +1,7 @@
 # Бенчмарки и расчёты
 
+**Русский** | [English](../en/bench/README.md)
+
 Скрипты, на которых построены цифры в [дизайне v4.9](../design/v4.9-context.md) (§10) и [дизайне v5](../design/v5-architecture.md) (§0, §6), и данные их прогонов. Это исследовательский код: в CI не запускается и в образ не попадает.
 
 ## Что нужно
@@ -24,6 +26,7 @@
 | `probe_compress_v48.py` | воспроизведение проблем сжатия v4.8 (P1–P13); для **v4.8** — кладётся в `tests/` и запускается `pytest -s` | — |
 | `live_v5.py` | живой прогон v5: прокси → llama.cpp, 22 хода, полная история как у Open WebUI; на каждом ходе `prompt_n` / `cache_n` и `/health` | `live_v5.json` |
 | `templates/` | проверка 32 шаблонов чата llama.cpp на стабильность префикса (см. [`templates/README.md`](templates/README.md)) | `res.json`, `check_out.txt`, `v48_out.txt` |
+| `embeddings/` | бенчмарк моделей эмбеддингов: USER2-small против granite-embedding-97m-multilingual-r2 (см. [`embeddings/README.md`](embeddings/README.md) и [исследование](../design/embedding-model.md)) | `emb_results.json` |
 
 ## Итоги
 - Пересчёт на ход после переполнения (токены, 60 ходов, `COMPRESS_AT=16000`): v4.8 — 3376, v4.9 + прогрев — 1235, **v5 — 278** (макс. 304), 5 смен эпохи, фон 43 994 токена (`EPOCH_AT=0.85`: 8 смен, 70 638).

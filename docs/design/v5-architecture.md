@@ -1,5 +1,7 @@
 # memory-proxy v5: архитектура контекста «только дописываем»
 
+**Русский** | [English](../en/design/v5-architecture.md)
+
 Статус: **реализовано в v5.0.0** (отклонения от проекта — §13, итоги регресса — [`../audit/v5.0.0-regression.md`](../audit/v5.0.0-regression.md)). Основа: [`v4.9-context.md`](v4.9-context.md) (P1–P13, §4.7, §5.9–§5.12).
 Расчёты: [`../bench/sim_v5.py`](../bench/sim_v5.py), [`../bench/sim.json`](../bench/sim.json) (ключи `v5`, `v5_bg`). Проверка на живом llama.cpp: [`../bench/validate_v5.py`](../bench/validate_v5.py), [`../bench/validate_v5.json`](../bench/validate_v5.json).
 
