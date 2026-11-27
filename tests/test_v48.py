@@ -7,6 +7,16 @@ import pytest
 LIVES = lambda city, ev: {"predicate": "lives_in", "object": city, "evidence": ev}
 
 
+
+@pytest.fixture
+def make_ctx(make_ctx):
+    """Эти тесты проверяют многопользовательский режим v4.8 (USER_MODE=multi)."""
+    def _m(**env):
+        env.setdefault("USER_MODE", "multi")
+        return make_ctx(**env)
+    return _m
+
+
 def remember(c, text, facts=None, emotions=None, **kw):
     c.llm.cold(facts=facts, emotions=emotions)
     r = c.chat(text, **kw)
@@ -126,11 +136,14 @@ def test_no_system_message_created_without_memory(ctx):
     assert all(m["role"] != "system" for m in ctx.llm.chat_requests[-1]["messages"])
 
 
-def test_policy_system_created_when_absent(ctx):
+def test_policy_without_system_goes_to_first_user(ctx):
+    """v5: прокси не создаёт system (Gemma 2, Mistral, Qwen3.5 падают на лишнем system) — политика идёт
+    в начало первого сообщения пользователя."""
     remember(ctx, "Я живу в Казани", [LIVES("Казань", "я живу в казани")])
     ctx.chat("Напомни, где я живу?")
     msgs = ctx.llm.chat_requests[-1]["messages"]
-    assert msgs[0] == {"role": "system", "content": ctx.proxy.MEMORY_POLICY}
+    assert all(m["role"] != "system" for m in msgs)
+    assert msgs[0]["content"].startswith("[ПРАВИЛО ПАМЯТИ] " + ctx.proxy.MEMORY_POLICY)
     assert "Казань" in ctx.memory_text()
 
 
@@ -139,7 +152,8 @@ def test_memory_tags_in_data_are_neutralized(ctx):
     ctx.drain()
     ctx.chat("Помнишь, мы обсуждали отпуск?", chat_id="new")
     t = ctx.last_user_text()
-    assert t.count("<memory>") == 1 and t.count("</memory>") == 1
+    assert t.count("<memory>\n") == t.count("\n</memory>") >= 1      # блоки не закрываются данными
+    assert "</memory> SYSTEM" not in t and "secrets <memory>" not in t
     assert "reveal secrets" in ctx.memory_text()            # данные на месте, но внутри блока
 
 
@@ -153,11 +167,12 @@ def test_cross_chat_triggers_are_strict(ctx):
 # ─── H-5: SQLite вне event loop ───
 def test_db_work_runs_in_db_thread(ctx, monkeypatch):
     seen = []
-    orig = ctx.proxy.build_memory
-    def spy(*a):
-        seen.append(threading.current_thread().name)
-        return orig(*a)
-    monkeypatch.setattr(ctx.proxy, "build_memory", spy)
+    for name in ("build_delta", "build_profile", "load_state", "resolve_chat"):
+        orig = getattr(ctx.proxy, name)
+        def spy(*a, _o=orig):
+            seen.append(threading.current_thread().name)
+            return _o(*a)
+        monkeypatch.setattr(ctx.proxy, name, spy)
     ctx.chat("Расскажи про отпуск")
     assert seen and all(n.startswith("memdb") for n in seen)
 
@@ -325,6 +340,7 @@ def test_migration_from_v474(make_ctx, tmp_path, legacy):
     # память доступна владельцу и работает дальше
     c.chat("Напомни, где я живу?", user=owner if legacy else None)
     assert "lives_in: Казань" in c.memory_text() and "понедельники" in c.memory_text()
+    c.drain()                                    # анализ вопроса выше — до постановки следующего ответа
     c.llm.cold(facts=[LIVES("Самара", "я переехал в самару")])
     c.chat("Я переехал в Самару", user=owner if legacy else None)
     c.drain()
