@@ -1,8 +1,13 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+
+# Data / model
 data/
+model/
 *.db
 *.sqlite
 *.db-shm
@@ -10,14 +15,11 @@ data/
 *.db.backup.*
 *.db.before_*
 *.db.cleanup_*
+
+# Local
+.env
+*.log
 .vscode/
 .idea/
 *.swp
 .DS_Store
-data/
-*.db
-*.db-wal
-*.db-shm
-__pycache__/
-.env
-model/

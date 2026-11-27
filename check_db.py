@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime
 
-DB_PATH = os.getenv("DB_PATH", "/home/admin/memory-mvp/data/memory.db")
+DB_PATH = os.getenv("DB_PATH", "/data/memory.db")
 
 # ANSI цвета
 GREEN = "\033[92m"
