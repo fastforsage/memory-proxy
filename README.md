@@ -284,21 +284,77 @@ docker push fastforsage/memory-proxy:v4.7.2
 
 ### Структура проекта
 
-```
-memory-proxy/
-├── Dockerfile
-├── requirements.txt
-├── proxy.py              # FastAPI app (~600 строк)
-├── download_model.py     # HF snapshot downloader
-├── docker-compose.yml
-├── LICENSE (MIT)
-├── README.md
-├── tests/
-│   └── test_proxy.py     # pytest, 8 тестов
-├── .github/workflows/
-│   └── docker-publish.yml
-└── data/                 # SQLite volume
-```
+## Архитектура системы обработки запросов
+
+```mermaid
+graph TD
+    %% Слой Клиента
+    subgraph Client_Layer ["Входящий запрос"]
+        C[Client]
+    end
+
+    %% Движок FastAPI
+    subgraph FastAPI_Engine ["FastAPI Engine (uvloop + orjson)"]
+        direction TB
+        Auth["API_KEY Check"]
+        Val["Validation (body, chat_id, content)"]
+        Pre["Preclassify (zlib)"]
+        
+        subgraph Preclass ["Классификация"]
+            P1[Personal]
+            P2[Technical]
+            P3[Mixed]
+        end
+        
+        Pre --> P1
+        Pre --> P2
+        Pre --> P3
+    end
+
+    %% Модуль Памяти
+    subgraph Memory_Module ["Memory Assembly"]
+        direction TB
+        M1["get_smart_facts (FTS5 + vec_facts RRF)"]
+        M2["search_other_chats (auto-trigger)"]
+        M3["emotions + mood_state"]
+        M4[summaries]
+        M5["style_examples (few-shot)"]
+    end
+
+    %% Слой Обработки
+    subgraph Processing ["Processing & Streaming"]
+        direction TB
+        Comp["Compression (if > COMPRESS_AT)"]
+        Stream["Streaming (SSE-buffer, status_code passthrough)"]
+    end
+
+    %% Асинхронный путь
+    subgraph Cold_Path ["Cold Path (async)"]
+        direction TB
+        L_Ext["LLM extractor (facts + emotions + mood)"]
+        L_Proof["Proof-check (verbatim)"]
+        L_Embed["Embedding (batch ONNX)"]
+        L_Style["Style scoring"]
+    end
+
+    %% Связи (Connections)
+    C --> Auth
+    Auth --> Val
+    Val --> Pre
+    Pre --> M1
+    Pre --> M2
+    Pre --> M3
+    Pre --> M4
+    Pre --> M5
+    
+    M1 & M2 & M3 & M4 & M5 --> Comp
+    Comp --> Stream
+    
+    %% Асинхронный триггер
+    Stream -.->|Async trigger| L_Ext
+    L_Ext --> L_Proof
+    L_Proof --> L_Embed
+    L_Embed --> L_Style
 
 ---
 
